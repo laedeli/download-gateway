@@ -23,7 +23,7 @@ func main() {
 	slog.SetDefault(logger)
 
 	addr := envOr("DOWNLOAD_GATEWAY_ADDR", ":8080")
-	brokers := envOr("KAFKA_BROKERS", "platform-event-streaming-kafka-bootstrap.platform-event-streaming.svc.cluster.local:9092")
+	brokers := envOr("KAFKA_BROKERS", "platform-kafka-kafka-bootstrap.platform-event-streaming.svc:9093")
 
 	slog.Info("starting download-gateway", "addr", addr, "kafka_brokers", brokers)
 
