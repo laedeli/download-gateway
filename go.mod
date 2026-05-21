@@ -1,6 +1,6 @@
 module gitlab.nalet.cloud/stube/download-gateway
 
-go 1.25.0
+go 1.23
 
 require (
 	github.com/IBM/sarama v1.43.3
