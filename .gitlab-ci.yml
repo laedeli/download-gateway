@@ -1,0 +1,35 @@
+# Stube standard pipeline scaffold.
+# Disabled by default — set CI_ENABLED=true as a CI/CD variable to activate.
+# See /projects/AGENTS.md for the GitOps workflow.
+
+workflow:
+  rules:
+    - if: $CI_ENABLED == "true"
+      when: always
+    - when: never
+
+stages:
+  - build
+  - containerize
+  - deploy
+
+build:
+  stage: build
+  script:
+    - echo "Placeholder build"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+
+containerize:
+  stage: containerize
+  script:
+    - echo "Placeholder Kaniko build"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+
+deploy:
+  stage: deploy
+  script:
+    - echo "Placeholder oc apply via pipeline"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"

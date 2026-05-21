@@ -1,0 +1,15 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: download-gateway
+  namespace: stube
+  labels:
+    app: download-gateway
+spec:
+  selector:
+    matchLabels:
+      app: download-gateway
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s

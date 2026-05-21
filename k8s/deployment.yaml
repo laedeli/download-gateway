@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: download-gateway
+  namespace: stube
+  labels:
+    app: download-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: download-gateway
+  template:
+    metadata:
+      labels:
+        app: download-gateway
+    spec:
+      containers:
+        - name: download-gateway
+          image: registry.nalet.cloud/stube/download-gateway:placeholder
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
