@@ -15,13 +15,44 @@ spec:
       labels:
         app: download-gateway
     spec:
+      imagePullSecrets:
+        - name: gitlab-registry
       containers:
         - name: download-gateway
-          image: registry.nalet.cloud/stube/download-gateway:placeholder
+          image: registry.nalet.cloud/stube/download-gateway:latest
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
               containerPort: 8080
+          env:
+            - name: DOWNLOAD_GATEWAY_ADDR
+              value: ":8080"
+            - name: POLL_INTERVAL
+              value: "5s"
+            # Kafka producer (mTLS). KAFKA_TLS_* point at the cert mounted
+            # from the stube-download-gateway KafkaUser secret. When unset
+            # the gateway logs events instead of publishing (scaffold mode).
+            - name: KAFKA_BROKERS
+              value: "platform-kafka-kafka-bootstrap.platform-event-streaming.svc:9093"
+            - name: KAFKA_TLS_CERT
+              value: "/etc/kafka-cert/user.crt"
+            - name: KAFKA_TLS_KEY
+              value: "/etc/kafka-cert/user.key"
+            - name: KAFKA_TLS_CA
+              value: "/etc/kafka-cert/ca.crt"
+            # oDownloader adapter. Cross-namespace today; becomes
+            # odownloader.stube.svc once ADR-019's migration lands.
+            - name: ODOWNLOADER_BASE_URL
+              value: "http://odownloader.cloud-nalet-odownloader.svc:80"
+            - name: ODOWNLOADER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: odownloader-api
+                  key: token
+          volumeMounts:
+            - name: kafka-cert
+              mountPath: /etc/kafka-cert
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /healthz
@@ -41,3 +72,8 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
+      volumes:
+        - name: kafka-cert
+          secret:
+            secretName: stube-download-gateway
+            optional: true

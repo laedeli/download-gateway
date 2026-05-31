@@ -23,6 +23,10 @@ func (n *NZBGet) Status(ctx context.Context, id string) (Status, error) {
 	return StatusQueued, nil
 }
 
+func (n *NZBGet) Describe(ctx context.Context, id string) (JobView, error) {
+	return JobView{State: StatusQueued, EtaSec: -1}, nil
+}
+
 func (n *NZBGet) Remove(ctx context.Context, id string) error {
 	slog.Debug("nzbget Remove stub", "id", id)
 	return nil

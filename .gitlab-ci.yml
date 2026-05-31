@@ -1,7 +1,14 @@
-# Stube standard pipeline scaffold.
+# Stube standard CI/CD pipeline for download-gateway.
 # Disabled by default — set CI_ENABLED=true as a CI/CD variable to activate.
-# See /projects/AGENTS.md for the GitOps workflow.
-
+# See https://kb.nalet.cloud/stube/adr/019-download-plane-consolidation
+#
+# Required CI/CD variables (group-level ones are shared with chino-api):
+#   CI_REGISTRY*, OC_SERVER, OC_TOKEN, REGISTRY_PULL_*  — group-level (exist)
+#   ODOWNLOADER_TOKEN                                   — masked; the oDownloader
+#       daemon's static bearer token (== secret odownloader-api key "token").
+#       The deploy job mints `odownloader-api` in stube from it so the gateway
+#       can reach the daemon. Once oDownloader migrates into stube (ADR-019)
+#       this becomes the same shared secret and the mint step is a no-op.
 workflow:
   rules:
     - if: $CI_ENABLED == "true"
@@ -9,27 +16,77 @@ workflow:
     - when: never
 
 stages:
-  - build
+  - test
   - containerize
   - deploy
 
-build:
-  stage: build
+variables:
+  IMAGE_NAME: $CI_REGISTRY_IMAGE
+  OC_NAMESPACE: stube
+
+test:
+  stage: test
+  image: registry.nalet.cloud/infrastructure/library/golang:1.24-alpine
   script:
-    - echo "Placeholder build"
+    - apk add --no-cache git
+    - go vet ./...
+    - go build ./...
   rules:
-    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: '$CI_PIPELINE_SOURCE == "push"'
 
 containerize:
   stage: containerize
+  image:
+    name: registry.nalet.cloud/infrastructure/library/kaniko-project/executor:debug
+    entrypoint: [""]
+  needs: ["test"]
   script:
-    - echo "Placeholder Kaniko build"
+    - mkdir -p "$DOCKER_CONFIG"
+    - REGISTRY_AUTH="$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')"
+    - |
+      cat > "$DOCKER_CONFIG/config.json" <<EOF
+      {"auths":{"$CI_REGISTRY":{"auth":"$REGISTRY_AUTH"}}}
+      EOF
+    - /kaniko/executor
+      --context $CI_PROJECT_DIR
+      --dockerfile $CI_PROJECT_DIR/Dockerfile
+      --destination "$IMAGE_NAME:$CI_COMMIT_SHORT_SHA"
+      --destination "$IMAGE_NAME:latest"
+      --push-retry=5
   rules:
-    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
 
 deploy:
   stage: deploy
+  image: registry.nalet.cloud/infrastructure/library/openshift/origin-cli:4.18
+  needs: ["containerize"]
   script:
-    - echo "Placeholder oc apply via pipeline"
+    - oc login "$OC_SERVER" --token="$OC_TOKEN" --insecure-skip-tls-verify=true
+    - |
+      oc -n "$OC_NAMESPACE" create secret docker-registry gitlab-registry \
+        --docker-server="$CI_REGISTRY" \
+        --docker-username="${REGISTRY_PULL_USER:-$CI_REGISTRY_USER}" \
+        --docker-password="${REGISTRY_PULL_PASSWORD:-$CI_REGISTRY_PASSWORD}" \
+        --dry-run=client -o yaml | oc -n "$OC_NAMESPACE" apply -f -
+    # Kafka mTLS client cert. Strimzi materialises the stube-download-gateway
+    # KafkaUser as a secret in platform-event-streaming; copy it into stube so
+    # the gateway pod can mount it (keys: user.crt / user.key / ca.crt).
+    - |
+      oc -n platform-event-streaming get secret stube-download-gateway -o yaml \
+        | sed 's/namespace: platform-event-streaming/namespace: stube/' \
+        | oc -n "$OC_NAMESPACE" apply -f -
+    # oDownloader daemon bearer token so the gateway adapter can drive it.
+    - |
+      oc -n "$OC_NAMESPACE" create secret generic odownloader-api \
+        --from-literal=token="${ODOWNLOADER_TOKEN}" \
+        --dry-run=client -o yaml | oc -n "$OC_NAMESPACE" apply -f -
+    - oc -n "$OC_NAMESPACE" apply -f k8s/service.yaml
+    - oc -n "$OC_NAMESPACE" apply -f k8s/servicemonitor.yaml
+    - oc -n "$OC_NAMESPACE" apply -f k8s/deployment.yaml
+    - oc -n "$OC_NAMESPACE" set image deployment/download-gateway download-gateway="$IMAGE_NAME:$CI_COMMIT_SHORT_SHA"
+    - oc -n "$OC_NAMESPACE" rollout status deployment/download-gateway --timeout=3m
+    - oc logout
+  environment:
+    name: download-gateway-beta
   rules:
-    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
