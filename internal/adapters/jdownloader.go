@@ -25,6 +25,10 @@ func (j *JDownloader) Status(ctx context.Context, id string) (Status, error) {
 	return StatusQueued, nil
 }
 
+func (j *JDownloader) Describe(ctx context.Context, id string) (JobView, error) {
+	return JobView{State: StatusQueued, EtaSec: -1}, nil
+}
+
 func (j *JDownloader) Remove(ctx context.Context, id string) error {
 	slog.Debug("jdownloader Remove stub", "id", id)
 	return nil

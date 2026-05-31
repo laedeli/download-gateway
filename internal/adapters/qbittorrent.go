@@ -23,6 +23,10 @@ func (q *QBittorrent) Status(ctx context.Context, id string) (Status, error) {
 	return StatusQueued, nil
 }
 
+func (q *QBittorrent) Describe(ctx context.Context, id string) (JobView, error) {
+	return JobView{State: StatusQueued, EtaSec: -1}, nil
+}
+
 func (q *QBittorrent) Remove(ctx context.Context, id string) error {
 	slog.Debug("qbittorrent Remove stub", "id", id)
 	return nil
