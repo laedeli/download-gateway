@@ -1,0 +1,287 @@
+# oDownloader (JDownloader client), migrated from cloud-nalet-odownloader.
+#
+# Differences from the infrastructure deployment:
+#   - namespace stube; storage = the shared `packages` NFS PVC (subPaths)
+#     instead of worker2-pinned local-temp-rwo PVs, so the pod is no longer
+#     node-bound and finished downloads land on the same NFS katalog ingests
+#     (ADR-019, user decision 2026-05-30: "stay in stube for shared NFS").
+#   - oauth2-proxy sidecar + Route dropped: the download-gateway drives the
+#     daemon in-cluster over the static-token API; the human UI is the Fiori
+#     download console (ADR-020), not oDownloader's own web UI. JDownloader's
+#     VNC UI (5800) stays reachable via `oc port-forward` for debugging.
+#   - WireGuard config comes from the `wireguard-config` Secret (minted by
+#     CI) via an init copy, replacing the hand-baked wireguard-config PV.
+#
+# JDownloader egresses through the WireGuard sidecar (user requirement:
+# "torrents and jdownloader go through wireguard").
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: odownloader
+  namespace: stube
+  labels:
+    app: odownloader
+    app.kubernetes.io/part-of: download-plane
+spec:
+  replicas: 1
+  strategy:
+    # Single writer to the NFS subPaths; avoid two pods racing on JD state.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: odownloader
+  template:
+    metadata:
+      labels:
+        app: odownloader
+        app.kubernetes.io/part-of: download-plane
+    spec:
+      serviceAccountName: download-clients
+      # Pod-level securityContext intentionally omitted: the wireguard
+      # sidecar needs to start as root for iptables/route setup before
+      # dropping to PUID, and the privileged SCC rejects the implicit
+      # seccomp annotation that runAsNonRoot+RuntimeDefault induces.
+      securityContext:
+        fsGroup: 1000
+      initContainers:
+        # Drop the WireGuard config from the Secret into the sidecar's
+        # writable /config so wg-quick can chmod it. Mounting the Secret
+        # read-only at /config/wg_confs trips linuxserver's boot chown.
+        - name: wg-seed
+          image: busybox:1.36
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              mkdir -p /config/wg_confs
+              cp /tmp/wg/wg0.conf /config/wg_confs/wg0.conf
+              chmod 600 /config/wg_confs/wg0.conf
+              echo "[wg-seed] wg0.conf installed"
+          volumeMounts:
+            - name: wg-state
+              mountPath: /config
+            - name: wg-secret
+              mountPath: /tmp/wg
+              readOnly: true
+        # Seed JD's config dir with our settings before jdownloader starts.
+        # Idempotent — only writes files that don't already exist, so
+        # operator changes in the JD UI win on subsequent boots. Enables
+        # the Deprecated/Direct RemoteAPI on 127.0.0.1:3128 so the daemon
+        # drives JD over loopback without a MyJDownloader cloud account.
+        - name: jd-cfg-seed
+          image: busybox:1.36
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              mkdir -p /config/cfg
+              seed() {
+                target="/config/cfg/$1"
+                if [ -f "$target" ]; then
+                  echo "[jd-cfg-seed] $1 exists, skipping"
+                else
+                  echo "[jd-cfg-seed] writing $target"
+                  printf '%s' "$2" > "$target"
+                  chmod 0644 "$target"
+                fi
+              }
+              seed org.jdownloader.api.RemoteAPIConfig.json '{"deprecatedapienabled":true,"deprecatedapilocalhostonly":true,"deprecatedapiport":3128,"externinterfaceenabled":true,"externinterfacelocalhostonly":true}'
+              seed org.jdownloader.gui.jdtrayicon.TrayExtension.json '{"enabled":false,"freshinstall":false}'
+              seed org.jdownloader.updatev2.UpdateSettings.json '{"autoupdatecheckenabled":false,"installupdatessilentlyifpossibleenabled":false,"installupdatesonexitenabled":false,"installupdatesonexitpanelvisible":false,"doaskbeforedownloadinganupdate":false,"doaskmebeforeinstallinganupdateenabled":false}'
+              seed org.jdownloader.settings.GeneralSettings.json '{"defaultdownloadfolder":"/output"}'
+              seed org.jdownloader.settings.GraphicalUserInterfaceSettings.json '{}'
+              echo "[jd-cfg-seed] done"
+          volumeMounts:
+            - name: packages
+              mountPath: /config
+              subPath: _config/jdownloader
+      containers:
+        - name: daemon
+          # Image is built by infrastructure/oDownloader CI. The gateway
+          # pipeline does not rebuild it — it only redeploys it into stube.
+          image: registry.nalet.cloud/infrastructure/odownloader:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8686
+              name: api
+          env:
+            - name: SERVER_ADDRESS
+              value: "0.0.0.0"
+            - name: SERVER_PORT
+              value: "8686"
+            - name: ODOWNLOADER_DOWNLOADS_DIRECTORY
+              value: "/downloads"
+            - name: ODOWNLOADER_API_AUTH
+              value: "token"
+            - name: ODOWNLOADER_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: odownloader-api
+                  key: token
+            - name: ODOWNLOADER_API_REMOTE_ACCESS_ENABLED
+              value: "true"
+            - name: JAVA_TOOL_OPTIONS
+              value: "-XX:MaxRAMPercentage=75.0 -XX:+UseContainerSupport"
+          volumeMounts:
+            - name: packages
+              mountPath: /downloads
+              subPath: _downloads
+            - name: packages
+              mountPath: /config
+              subPath: _config/odownloader
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: api
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: api
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+
+        # JDownloader 2 (jlesage). The daemon drives it via the local
+        # Deprecated/Direct RemoteAPI on 127.0.0.1:3128 (jd-cfg-seed init).
+        # 5800 = jlesage web UI, exposed only for port-forward debugging.
+        - name: jdownloader
+          image: jlesage/jdownloader-2:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: USER_ID
+              value: "1000"
+            - name: GROUP_ID
+              value: "1000"
+            - name: TZ
+              value: Europe/Zurich
+            - name: KEEP_APP_RUNNING
+              value: "1"
+            - name: JDOWNLOADER_MAX_MEM
+              value: "768m"
+          ports:
+            - containerPort: 5800
+              name: jd-ui
+            - containerPort: 3128
+              name: jd-api
+          volumeMounts:
+            - name: packages
+              mountPath: /config
+              subPath: _config/jdownloader
+            - name: packages
+              mountPath: /output
+              subPath: _downloads
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "wget -qO- --timeout=3 http://127.0.0.1:3128/jd/version >/dev/null"]
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 8
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "wget -qO- --timeout=3 http://127.0.0.1:3128/jd/version >/dev/null"]
+            initialDelaySeconds: 180
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 200m
+              memory: 768Mi
+            limits:
+              cpu: "2"
+              memory: 1536Mi
+
+        # WireGuard egress sidecar. Owns the pod netns, default route via
+        # wg0, cluster CIDRs excepted (see the wg0.conf PostUp in the
+        # wireguard-config Secret). daemon + jdownloader internet egress
+        # transparently goes through the VPN.
+        - name: vpn
+          image: ghcr.io/linuxserver/wireguard:latest
+          imagePullPolicy: Always
+          env:
+            - name: PUID
+              value: "1000"
+            - name: PGID
+              value: "1000"
+            - name: TZ
+              value: Europe/Zurich
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - NET_ADMIN
+                - SYS_MODULE
+          volumeMounts:
+            - name: wg-state
+              mountPath: /config
+            - name: lib-modules
+              mountPath: /lib/modules
+              readOnly: true
+            - name: dev-net-tun
+              mountPath: /dev/net/tun
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+
+      volumes:
+        # Shared NFS — finished downloads under _downloads, app/JD config
+        # under _config/* (subPaths of the same export katalog ingests).
+        # JD state, daemon config and finished downloads are all subPaths of
+        # this one claim (_config/jdownloader, _config/odownloader,
+        # _downloads) so plugin caches / accounts survive a reschedule
+        # without pinning the pod to a node.
+        - name: packages
+          persistentVolumeClaim:
+            claimName: packages
+        - name: wg-state
+          emptyDir: {}
+        - name: wg-secret
+          secret:
+            secretName: wireguard-config
+            items:
+              - key: wg0.conf
+                path: wg0.conf
+        - name: lib-modules
+          hostPath:
+            path: /lib/modules
+            type: ""
+        - name: dev-net-tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: odownloader
+  namespace: stube
+  labels:
+    app: odownloader
+    app.kubernetes.io/part-of: download-plane
+spec:
+  selector:
+    app: odownloader
+  ports:
+    # Direct daemon API — the download-gateway adapter and katalog-manager-api
+    # bridge call this with the static bearer token. No public Route.
+    - name: api
+      port: 8686
+      targetPort: api
+      protocol: TCP

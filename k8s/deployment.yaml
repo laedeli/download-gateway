@@ -40,10 +40,12 @@ spec:
               value: "/etc/kafka-cert/user.key"
             - name: KAFKA_TLS_CA
               value: "/etc/kafka-cert/ca.crt"
-            # oDownloader adapter. Cross-namespace today; becomes
-            # odownloader.stube.svc once ADR-019's migration lands.
+            # oDownloader adapter — the daemon's direct static-token API
+            # (port 8686), now in-stube after the ADR-019 migration. (The
+            # old cross-namespace :80 went through the oauth2-proxy, which
+            # the stube deployment drops.)
             - name: ODOWNLOADER_BASE_URL
-              value: "http://odownloader.cloud-nalet-odownloader.svc:80"
+              value: "http://odownloader.stube.svc.cluster.local:8686"
             - name: ODOWNLOADER_TOKEN
               valueFrom:
                 secretKeyRef:

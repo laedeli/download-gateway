@@ -1,0 +1,97 @@
+# NZBGet (usenet client) — egresses DIRECTLY, no WireGuard sidecar (user
+# requirement: "only nzbget goes directly"). Usenet is fetched over TLS
+# from the provider; no torrent swarm to hide, so no VPN. Writes finished
+# downloads to the same shared NFS the other clients use.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nzbget
+  namespace: stube
+  labels:
+    app: nzbget
+    app.kubernetes.io/part-of: download-plane
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: nzbget
+  template:
+    metadata:
+      labels:
+        app: nzbget
+        app.kubernetes.io/part-of: download-plane
+    spec:
+      # No VPN sidecar here, so no privileged SCC needed — but keep the same
+      # SA for a single NetworkPolicy/RBAC surface across the download plane.
+      serviceAccountName: download-clients
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: nzbget
+          image: lscr.io/linuxserver/nzbget:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PUID
+              value: "1000"
+            - name: PGID
+              value: "1000"
+            - name: TZ
+              value: Europe/Zurich
+          ports:
+            - name: http
+              containerPort: 6789
+              protocol: TCP
+          volumeMounts:
+            - name: packages
+              mountPath: /config
+              subPath: _config/nzbget
+            - name: packages
+              mountPath: /downloads
+              subPath: _downloads
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+      volumes:
+        - name: packages
+          persistentVolumeClaim:
+            claimName: packages
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nzbget
+  namespace: stube
+  labels:
+    app: nzbget
+    app.kubernetes.io/part-of: download-plane
+spec:
+  selector:
+    app: nzbget
+  ports:
+    # WebUI / JSON-RPC — the gateway's nzbget adapter drives this in-cluster.
+    - name: http
+      port: 6789
+      targetPort: http
+      protocol: TCP

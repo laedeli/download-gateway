@@ -1,0 +1,45 @@
+# SCC bindings for the download-clients ServiceAccount.
+#
+# The WireGuard egress sidecar (linuxserver/wireguard) on the oDownloader
+# and qBittorrent pods needs:
+#   - privileged: true            (/dev/net/tun + ip rule / nft manipulation)
+#   - NET_ADMIN + SYS_MODULE       (load the wireguard kernel module)
+#   - hostPath mounts              (/lib/modules, /dev/net/tun)
+# None of these are allowed by OpenShift's default restricted-v2 SCC, so we
+# bind the privileged SCC ClusterRole to this namespace SA.
+#
+# linuxserver/* images additionally run as UID 1000 (PUID env), so we also
+# bind anyuid so OpenShift doesn't remap them into stube's allocated UID
+# range. Same pattern the infrastructure/oDownloader deployment used
+# (verified 2026-05-21) — scoped here to `download-clients` only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: download-clients-scc-privileged
+  namespace: stube
+  labels:
+    app.kubernetes.io/part-of: download-plane
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:privileged
+subjects:
+  - kind: ServiceAccount
+    name: download-clients
+    namespace: stube
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: download-clients-scc-anyuid
+  namespace: stube
+  labels:
+    app.kubernetes.io/part-of: download-plane
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:anyuid
+subjects:
+  - kind: ServiceAccount
+    name: download-clients
+    namespace: stube
