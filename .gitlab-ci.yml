@@ -6,9 +6,18 @@
 #   CI_REGISTRY*, OC_SERVER, OC_TOKEN, REGISTRY_PULL_*  — group-level (exist)
 #   ODOWNLOADER_TOKEN                                   — masked; the oDownloader
 #       daemon's static bearer token (== secret odownloader-api key "token").
-#       The deploy job mints `odownloader-api` in stube from it so the gateway
-#       can reach the daemon. Once oDownloader migrates into stube (ADR-019)
-#       this becomes the same shared secret and the mint step is a no-op.
+#       The deploy job mints `odownloader-api` in stube from it; both the
+#       gateway and the migrated oDownloader daemon consume it.
+#   WIREGUARD_CONF                                      — masked/file; the full
+#       wg0.conf (incl. the cluster-CIDR PostUp split-tunnel rules — see
+#       k8s/clients/secrets.example.yaml). The deploy job mints the
+#       `wireguard-config` secret the oDownloader + qBittorrent VPN sidecars
+#       mount. NZBGet egresses directly and does not use it.
+#
+# The deploy job also provisions the migrated download clients (oDownloader,
+# qBittorrent, NZBGet) into stube — the download plane is one deployable unit
+# (ADR-019). The oDownloader daemon image itself is built by the
+# infrastructure/oDownloader pipeline; here we only (re)deploy it.
 workflow:
   rules:
     - if: $CI_ENABLED == "true"
@@ -75,11 +84,36 @@ deploy:
       oc -n platform-event-streaming get secret stube-download-gateway -o yaml \
         | sed 's/namespace: platform-event-streaming/namespace: stube/' \
         | oc -n "$OC_NAMESPACE" apply -f -
-    # oDownloader daemon bearer token so the gateway adapter can drive it.
+    # oDownloader daemon bearer token — consumed by both the gateway adapter
+    # and the migrated oDownloader daemon (odownloader-api secret).
     - |
       oc -n "$OC_NAMESPACE" create secret generic odownloader-api \
         --from-literal=token="${ODOWNLOADER_TOKEN}" \
         --dry-run=client -o yaml | oc -n "$OC_NAMESPACE" apply -f -
+    # WireGuard config for the oDownloader + qBittorrent VPN sidecars.
+    - |
+      if [ -n "${WIREGUARD_CONF:-}" ]; then
+        oc -n "$OC_NAMESPACE" create secret generic wireguard-config \
+          --from-literal=wg0.conf="${WIREGUARD_CONF}" \
+          --dry-run=client -o yaml | oc -n "$OC_NAMESPACE" apply -f -
+      else
+        echo "WIREGUARD_CONF not set; expecting an existing wireguard-config secret"
+        oc -n "$OC_NAMESPACE" get secret wireguard-config >/dev/null
+      fi
+    # --- Download plane: clients (ADR-019, one deployable unit) ---
+    # SA + privileged/anyuid SCC for the WireGuard sidecars.
+    - oc -n "$OC_NAMESPACE" apply -f k8s/clients/serviceaccount.yaml
+    - oc -n "$OC_NAMESPACE" apply -f k8s/clients/scc-bindings.yaml
+    - oc -n "$OC_NAMESPACE" apply -f k8s/clients/networkpolicy.yaml
+    # The clients pull the oDownloader daemon image from the infrastructure
+    # group and the linuxserver/jlesage images via the cache mirror, so the
+    # gitlab-registry pull secret (created above) must be linked to the SA.
+    - oc -n "$OC_NAMESPACE" secrets link download-clients gitlab-registry --for=pull
+    - oc -n "$OC_NAMESPACE" apply -f k8s/clients/odownloader.yaml
+    - oc -n "$OC_NAMESPACE" apply -f k8s/clients/qbittorrent.yaml
+    - oc -n "$OC_NAMESPACE" apply -f k8s/clients/nzbget.yaml
+    - oc -n "$OC_NAMESPACE" rollout status deployment/odownloader --timeout=10m
+    # --- Gateway control plane ---
     - oc -n "$OC_NAMESPACE" apply -f k8s/service.yaml
     - oc -n "$OC_NAMESPACE" apply -f k8s/servicemonitor.yaml
     - oc -n "$OC_NAMESPACE" apply -f k8s/deployment.yaml

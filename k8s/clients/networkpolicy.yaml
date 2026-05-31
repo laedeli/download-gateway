@@ -1,0 +1,44 @@
+# NetworkPolicy for the download plane. Additive and deliberately loose
+# for the beta: the goal is to document intent and keep the gateway ->
+# client and client -> internet/VPN paths explicit, not to lock the
+# namespace down (that's a later hardening pass).
+#
+# Ingress: client WebUIs/APIs are reachable only from inside stube (the
+# download-gateway pod). Nothing external hits them directly — the human
+# UI is the Fiori console.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: download-clients-ingress
+  namespace: stube
+  labels:
+    app.kubernetes.io/part-of: download-plane
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: download-plane
+  policyTypes:
+    - Ingress
+  ingress:
+    # From any pod in stube (the gateway, katalog-manager-api bridge).
+    - from:
+        - podSelector: {}
+---
+# Egress: clients need to reach the VPN endpoint, usenet/torrent peers and
+# in-cluster Services (Kafka, the daemon API). Allow all egress; the
+# WireGuard sidecars do the actual split-tunnel routing per wg0.conf.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: download-clients-egress
+  namespace: stube
+  labels:
+    app.kubernetes.io/part-of: download-plane
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: download-plane
+  policyTypes:
+    - Egress
+  egress:
+    - {}
