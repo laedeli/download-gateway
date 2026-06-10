@@ -83,11 +83,16 @@ deploy:
     # Recreate from the three data keys rather than piping the whole object —
     # the source secret carries Strimzi ownerReferences (blockOwnerDeletion ->
     # the KafkaUser) that a cross-namespace apply rejects as Forbidden.
+    # ca.crt must be the CLUSTER CA (verifies the broker's server cert), NOT
+    # the KafkaUser secret's own ca.crt (that's the clients-CA and yields
+    # "x509: certificate signed by unknown authority"). user.crt/user.key are
+    # the client identity from the KafkaUser secret.
     - |
       SRC=stube-download-gateway
+      CA=platform-kafka-cluster-ca-cert
       if oc -n platform-event-streaming get secret "$SRC" >/dev/null 2>&1; then
         oc -n "$OC_NAMESPACE" create secret generic "$SRC" \
-          --from-literal=ca.crt="$(oc -n platform-event-streaming get secret $SRC -o jsonpath='{.data.ca\.crt}' | base64 -d)" \
+          --from-literal=ca.crt="$(oc -n platform-event-streaming get secret $CA -o jsonpath='{.data.ca\.crt}' | base64 -d)" \
           --from-literal=user.crt="$(oc -n platform-event-streaming get secret $SRC -o jsonpath='{.data.user\.crt}' | base64 -d)" \
           --from-literal=user.key="$(oc -n platform-event-streaming get secret $SRC -o jsonpath='{.data.user\.key}' | base64 -d)" \
           --dry-run=client -o yaml | oc -n "$OC_NAMESPACE" apply -f -
