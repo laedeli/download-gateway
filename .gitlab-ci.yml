@@ -84,12 +84,28 @@ deploy:
       oc -n platform-event-streaming get secret stube-download-gateway -o yaml \
         | sed 's/namespace: platform-event-streaming/namespace: stube/' \
         | oc -n "$OC_NAMESPACE" apply -f -
-    # oDownloader daemon bearer token — consumed by both the gateway adapter
-    # and the migrated oDownloader daemon (odownloader-api secret).
+    # oDownloader daemon bearer token — consumed by the gateway adapter, the
+    # migrated daemon, and katalog-manager-api (all read the odownloader-api
+    # secret). Create-if-absent so the token is stable across redeploys; value
+    # comes from the ODOWNLOADER_TOKEN CI var, else the old namespace's secret
+    # (parallel-run), else a freshly minted random token. No CI var required.
     - |
-      oc -n "$OC_NAMESPACE" create secret generic odownloader-api \
-        --from-literal=token="${ODOWNLOADER_TOKEN}" \
-        --dry-run=client -o yaml | oc -n "$OC_NAMESPACE" apply -f -
+      if oc -n "$OC_NAMESPACE" get secret odownloader-api >/dev/null 2>&1; then
+        echo "odownloader-api already present in $OC_NAMESPACE; keeping it"
+      else
+        TOKEN="${ODOWNLOADER_TOKEN:-}"
+        if [ -z "$TOKEN" ]; then
+          TOKEN=$(oc -n cloud-nalet-odownloader get secret odownloader-api -o jsonpath='{.data.token}' 2>/dev/null | base64 -d || true)
+          [ -n "$TOKEN" ] && echo "sourced oDownloader token from cloud-nalet-odownloader"
+        fi
+        if [ -z "$TOKEN" ]; then
+          TOKEN=$(openssl rand -hex 24)
+          echo "minted a fresh oDownloader API token"
+        fi
+        oc -n "$OC_NAMESPACE" create secret generic odownloader-api \
+          --from-literal=token="$TOKEN" \
+          --dry-run=client -o yaml | oc -n "$OC_NAMESPACE" apply -f -
+      fi
     # WireGuard config for the oDownloader + qBittorrent VPN sidecars.
     - |
       if [ -n "${WIREGUARD_CONF:-}" ]; then
