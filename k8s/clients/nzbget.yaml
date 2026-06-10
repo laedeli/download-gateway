@@ -52,14 +52,13 @@ spec:
             - name: packages
               mountPath: /downloads
               subPath: _downloads
-          # No liveness probe: the linuxserver s6 init supervises nzbget, and
-          # its WebUI on NFS-backed /config is intermittently slow to answer —
-          # an HTTP liveness probe was SIGTERM-killing a healthy process every
-          # ~3.5 min (exitCode 0 / Completed) in a restart loop. Readiness is
-          # lenient (long timeout + high threshold) for the same reason.
+          # No liveness probe (s6 supervises nzbget). Readiness is a TCP socket
+          # check, NOT httpGet: nzbget's WebUI answers 200 only to localhost and
+          # returns 401 to the pod IP the kubelet probes, so an httpGet probe
+          # never goes Ready. Port-open is the right signal here (nothing
+          # consumes nzbget yet; its adapter is still a stub).
           readinessProbe:
-            httpGet:
-              path: /
+            tcpSocket:
               port: http
             initialDelaySeconds: 20
             periodSeconds: 20
