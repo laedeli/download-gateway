@@ -10,6 +10,9 @@ spec:
   selector:
     app: download-gateway
   ports:
+    # Port 8080 (not 80) so the in-cluster URL matches the container port and
+    # katalog-manager-api's DOWNLOAD_GATEWAY_URL (…svc:8080). ServiceMonitor
+    # targets the port by name ("http"), so the number change is safe.
     - name: http
-      port: 80
+      port: 8080
       targetPort: 8080
