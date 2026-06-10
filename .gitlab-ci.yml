@@ -107,8 +107,15 @@ deploy:
           --dry-run=client -o yaml | oc -n "$OC_NAMESPACE" apply -f -
       fi
     # WireGuard config for the oDownloader + qBittorrent VPN sidecars.
+    # WIREGUARD_CONF is a file-type CI var (the wg0.conf is multi-line, so it
+    # can't be a masked var); fall back to a literal value or a pre-existing
+    # secret. The value is never echoed.
     - |
-      if [ -n "${WIREGUARD_CONF:-}" ]; then
+      if [ -n "${WIREGUARD_CONF:-}" ] && [ -f "${WIREGUARD_CONF}" ]; then
+        oc -n "$OC_NAMESPACE" create secret generic wireguard-config \
+          --from-file=wg0.conf="${WIREGUARD_CONF}" \
+          --dry-run=client -o yaml | oc -n "$OC_NAMESPACE" apply -f -
+      elif [ -n "${WIREGUARD_CONF:-}" ]; then
         oc -n "$OC_NAMESPACE" create secret generic wireguard-config \
           --from-literal=wg0.conf="${WIREGUARD_CONF}" \
           --dry-run=client -o yaml | oc -n "$OC_NAMESPACE" apply -f -
