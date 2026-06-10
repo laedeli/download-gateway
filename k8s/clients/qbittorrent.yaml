@@ -47,7 +47,9 @@ spec:
               readOnly: true
       containers:
         - name: qbittorrent
-          image: lscr.io/linuxserver/qbittorrent:latest
+          # docker.io, not lscr.io — the cluster image-signature policy rejects
+          # lscr.io ("Source image rejected by policy"); docker.io is allowed.
+          image: linuxserver/qbittorrent:latest
           imagePullPolicy: IfNotPresent
           env:
             - name: PUID

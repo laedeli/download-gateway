@@ -30,7 +30,9 @@ spec:
         fsGroup: 1000
       containers:
         - name: nzbget
-          image: lscr.io/linuxserver/nzbget:latest
+          # docker.io, not lscr.io — the cluster image-signature policy rejects
+          # lscr.io ("Source image rejected by policy"); docker.io is allowed.
+          image: linuxserver/nzbget:latest
           imagePullPolicy: IfNotPresent
           env:
             - name: PUID
