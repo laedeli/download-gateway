@@ -52,22 +52,19 @@ spec:
             - name: packages
               mountPath: /downloads
               subPath: _downloads
+          # No liveness probe: the linuxserver s6 init supervises nzbget, and
+          # its WebUI on NFS-backed /config is intermittently slow to answer —
+          # an HTTP liveness probe was SIGTERM-killing a healthy process every
+          # ~3.5 min (exitCode 0 / Completed) in a restart loop. Readiness is
+          # lenient (long timeout + high threshold) for the same reason.
           readinessProbe:
             httpGet:
               path: /
               port: http
-            initialDelaySeconds: 10
-            periodSeconds: 15
-            timeoutSeconds: 5
-            failureThreshold: 6
-          livenessProbe:
-            httpGet:
-              path: /
-              port: http
-            initialDelaySeconds: 30
-            periodSeconds: 30
-            timeoutSeconds: 5
-            failureThreshold: 6
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            timeoutSeconds: 10
+            failureThreshold: 12
           resources:
             requests:
               cpu: 100m

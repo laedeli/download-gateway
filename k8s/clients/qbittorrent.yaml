@@ -77,22 +77,17 @@ spec:
             - name: packages
               mountPath: /downloads
               subPath: _downloads
+          # No liveness probe (s6-supervised); lenient readiness — the WebUI on
+          # NFS-backed /config can be intermittently slow, and an aggressive
+          # liveness probe SIGTERM-loops a healthy process (see nzbget).
           readinessProbe:
             httpGet:
               path: /
               port: web
-            initialDelaySeconds: 15
-            periodSeconds: 15
-            timeoutSeconds: 5
-            failureThreshold: 6
-          livenessProbe:
-            httpGet:
-              path: /
-              port: web
-            initialDelaySeconds: 60
-            periodSeconds: 30
-            timeoutSeconds: 5
-            failureThreshold: 6
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            timeoutSeconds: 10
+            failureThreshold: 12
           resources:
             requests:
               cpu: 100m
