@@ -1,33 +1,25 @@
 # SCC bindings for the download-clients ServiceAccount.
 #
 # The WireGuard egress sidecar (linuxserver/wireguard) on the oDownloader
-# and qBittorrent pods needs:
-#   - privileged: true            (/dev/net/tun + ip rule / nft manipulation)
-#   - NET_ADMIN + SYS_MODULE       (load the wireguard kernel module)
-#   - hostPath mounts              (/lib/modules, /dev/net/tun)
-# None of these are allowed by OpenShift's default restricted-v2 SCC, so we
-# bind the privileged SCC ClusterRole to this namespace SA.
+# and qBittorrent pods needs the **privileged** SCC (/dev/net/tun + ip rule
+# manipulation, NET_ADMIN + SYS_MODULE, /lib/modules + /dev/net/tun hostPath).
 #
-# linuxserver/* images additionally run as UID 1000 (PUID env), so we also
-# bind anyuid so OpenShift doesn't remap them into stube's allocated UID
-# range. Same pattern the infrastructure/oDownloader deployment used
-# (verified 2026-05-21) — scoped here to `download-clients` only.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: download-clients-scc-privileged
-  namespace: stube
-  labels:
-    app.kubernetes.io/part-of: download-plane
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: system:openshift:scc:privileged
-subjects:
-  - kind: ServiceAccount
-    name: download-clients
-    namespace: stube
----
+# IMPORTANT: the stube:deployer holds `anyuid` but NOT `privileged`, so it
+# cannot create a RoleBinding granting privileged (RBAC escalation block —
+# "attempting to grant RBAC permissions not currently held"). The privileged
+# grant is therefore a ONE-TIME cluster-admin action, out of this pipeline:
+#
+#     oc adm policy add-scc-to-user privileged -z download-clients -n stube
+#
+# (mirrors how the deployer's own `anyuid` grant was set up out-of-band, and
+# how infrastructure/oDownloader's pipeline — which runs with a privileged
+# token — binds privileged to its SA). Until that grant exists, the
+# oDownloader + qBittorrent pods (with the VPN sidecar) won't be admitted;
+# NZBGet (no sidecar) and the gateway are unaffected.
+#
+# This file only carries the `anyuid` binding the deployer CAN grant
+# (linuxserver/* images run as UID 1000 via PUID; anyuid stops OpenShift
+# remapping them into stube's allocated UID range).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
