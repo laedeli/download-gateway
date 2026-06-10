@@ -80,10 +80,20 @@ deploy:
     # Kafka mTLS client cert. Strimzi materialises the stube-download-gateway
     # KafkaUser as a secret in platform-event-streaming; copy it into stube so
     # the gateway pod can mount it (keys: user.crt / user.key / ca.crt).
+    # Recreate from the three data keys rather than piping the whole object —
+    # the source secret carries Strimzi ownerReferences (blockOwnerDeletion ->
+    # the KafkaUser) that a cross-namespace apply rejects as Forbidden.
     - |
-      oc -n platform-event-streaming get secret stube-download-gateway -o yaml \
-        | sed 's/namespace: platform-event-streaming/namespace: stube/' \
-        | oc -n "$OC_NAMESPACE" apply -f -
+      SRC=stube-download-gateway
+      if oc -n platform-event-streaming get secret "$SRC" >/dev/null 2>&1; then
+        oc -n "$OC_NAMESPACE" create secret generic "$SRC" \
+          --from-literal=ca.crt="$(oc -n platform-event-streaming get secret $SRC -o jsonpath='{.data.ca\.crt}' | base64 -d)" \
+          --from-literal=user.crt="$(oc -n platform-event-streaming get secret $SRC -o jsonpath='{.data.user\.crt}' | base64 -d)" \
+          --from-literal=user.key="$(oc -n platform-event-streaming get secret $SRC -o jsonpath='{.data.user\.key}' | base64 -d)" \
+          --dry-run=client -o yaml | oc -n "$OC_NAMESPACE" apply -f -
+      else
+        echo "$SRC KafkaUser secret not readable in platform-event-streaming; gateway will run in scaffold (log-only) mode"
+      fi
     # oDownloader daemon bearer token — consumed by the gateway adapter, the
     # migrated daemon, and katalog-manager-api (all read the odownloader-api
     # secret). Create-if-absent so the token is stable across redeploys; value
