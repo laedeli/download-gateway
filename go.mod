@@ -6,6 +6,7 @@ toolchain go1.24.1
 
 require (
 	github.com/IBM/sarama v1.43.3
+	github.com/coreos/go-oidc/v3 v3.11.0
 	github.com/go-chi/chi/v5 v5.1.0
 	github.com/prometheus/client_golang v1.23.2
 )
@@ -17,6 +18,7 @@ require (
 	github.com/eapache/go-resiliency v1.7.0 // indirect
 	github.com/eapache/go-xerial-snappy v0.0.0-20230731223053-c322873962e3 // indirect
 	github.com/eapache/queue v1.1.0 // indirect
+	github.com/go-jose/go-jose/v4 v4.0.2 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/hashicorp/errwrap v1.0.0 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
@@ -27,6 +29,7 @@ require (
 	github.com/jcmturner/gokrb5/v8 v8.4.4 // indirect
 	github.com/jcmturner/rpc/v2 v2.0.3 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
+	github.com/kr/text v0.2.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/pierrec/lz4/v4 v4.1.21 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
@@ -36,6 +39,7 @@ require (
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	golang.org/x/crypto v0.41.0 // indirect
 	golang.org/x/net v0.43.0 // indirect
+	golang.org/x/oauth2 v0.30.0 // indirect
 	golang.org/x/sys v0.35.0 // indirect
 	google.golang.org/protobuf v1.36.8 // indirect
 )

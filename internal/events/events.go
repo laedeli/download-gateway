@@ -27,7 +27,10 @@ import (
 	"github.com/IBM/sarama"
 )
 
-const topicPrefix = "stube.download.client."
+// defaultTopicPrefix keeps prod (single-tenant stube) byte-identical. On a
+// shared cluster the tenant sets KAFKA_TOPIC_PREFIX (e.g. "zaentrum-beta.") so
+// events land under its own namespace; the full topic is <prefix>download.client.<kind>.
+const defaultTopicPrefix = "stube."
 
 // Event kinds map to the four topics.
 const (
@@ -82,7 +85,18 @@ type Failed struct {
 // scaffold mode (logs instead of publishing) so the gateway can run
 // locally without Kafka.
 type Publisher struct {
-	p sarama.SyncProducer
+	p      sarama.SyncProducer
+	prefix string // <prefix>download.client.<kind>; defaults to "stube." when blank
+}
+
+// topicFor builds the full topic name for an event kind. Nil-safe: emit's
+// defensive p==nil path still resolves a topic string for the scaffold log.
+func (p *Publisher) topicFor(kind string) string {
+	prefix := defaultTopicPrefix
+	if p != nil && p.prefix != "" {
+		prefix = p.prefix
+	}
+	return prefix + "download.client." + kind
 }
 
 // Config controls how the producer authenticates.
@@ -93,15 +107,23 @@ type Config struct {
 	CertFile string
 	KeyFile  string
 	CAFile   string
+	// TopicPrefix is the per-tenant namespace (default "stube."). The four
+	// topics are <TopicPrefix>download.client.{started,progress,completed,failed}.
+	TopicPrefix string
 }
 
 // ConfigFromEnv reads the standard env wiring (set by the Deployment).
 func ConfigFromEnv() Config {
+	prefix := strings.TrimSpace(os.Getenv("KAFKA_TOPIC_PREFIX"))
+	if prefix == "" {
+		prefix = defaultTopicPrefix
+	}
 	return Config{
-		Brokers:  os.Getenv("KAFKA_BROKERS"),
-		CertFile: os.Getenv("KAFKA_TLS_CERT"),
-		KeyFile:  os.Getenv("KAFKA_TLS_KEY"),
-		CAFile:   os.Getenv("KAFKA_TLS_CA"),
+		Brokers:     os.Getenv("KAFKA_BROKERS"),
+		CertFile:    os.Getenv("KAFKA_TLS_CERT"),
+		KeyFile:     os.Getenv("KAFKA_TLS_KEY"),
+		CAFile:      os.Getenv("KAFKA_TLS_CA"),
+		TopicPrefix: prefix,
 	}
 }
 
@@ -112,7 +134,7 @@ func NewPublisher(c Config) (*Publisher, error) {
 	if c.Brokers == "" || c.CertFile == "" {
 		slog.Warn("kafka not configured; running events in scaffold (log-only) mode",
 			"brokers_set", c.Brokers != "", "cert_set", c.CertFile != "")
-		return &Publisher{}, nil
+		return &Publisher{prefix: c.TopicPrefix}, nil
 	}
 	tlsCfg, err := mTLS(c)
 	if err != nil {
@@ -131,8 +153,8 @@ func NewPublisher(c Config) (*Publisher, error) {
 	if err != nil {
 		return nil, err
 	}
-	slog.Info("kafka producer connected (mTLS)", "brokers", c.Brokers)
-	return &Publisher{p: p}, nil
+	slog.Info("kafka producer connected (mTLS)", "brokers", c.Brokers, "topic_prefix", c.TopicPrefix)
+	return &Publisher{p: p, prefix: c.TopicPrefix}, nil
 }
 
 func mTLS(c Config) (*tls.Config, error) {
@@ -163,7 +185,7 @@ func (p *Publisher) emit(ctx context.Context, kind, adapter, clientID string, pa
 	if err != nil {
 		return err
 	}
-	topic := topicPrefix + kind
+	topic := p.topicFor(kind)
 	if p == nil || p.p == nil {
 		slog.Debug("publish (scaffold no-op)", "topic", topic, "key", adapter+":"+clientID, "bytes", len(b))
 		return nil
