@@ -16,6 +16,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"gitlab.nalet.cloud/stube/download-gateway/internal/adapters"
+	"gitlab.nalet.cloud/stube/download-gateway/internal/auth"
 	"gitlab.nalet.cloud/stube/download-gateway/internal/events"
 )
 
@@ -43,14 +44,18 @@ func main() {
 
 	addr := envOr("DOWNLOAD_GATEWAY_ADDR", ":8080")
 
-	// Wire only the adapters this deployment is configured for. v1 ships
-	// oDownloader (the one client with a live instance + verified API);
-	// qBittorrent/NZBGet/JDownloader come online once the consolidation
-	// lands and their endpoints/creds are provided.
+	// Wire only the adapters this deployment is configured for (an adapter with
+	// no endpoint is omitted, not stubbed). oDownloader has a live prod instance;
+	// qBittorrent is the neutral torrent client for the laedeli acquisition addon.
 	var configured []adapters.Adapter
 	if base := os.Getenv("ODOWNLOADER_BASE_URL"); base != "" {
 		configured = append(configured, adapters.NewODownloader(base, os.Getenv("ODOWNLOADER_TOKEN")))
 		slog.Info("odownloader adapter configured", "base_url", base)
+	}
+	if base := os.Getenv("QBITTORRENT_BASE_URL"); base != "" {
+		configured = append(configured, adapters.NewQBittorrent(base,
+			os.Getenv("QBITTORRENT_USER"), os.Getenv("QBITTORRENT_PASS")))
+		slog.Info("qbittorrent adapter configured", "base_url", base)
 	}
 	reg := adapters.NewRegistry(configured...)
 
@@ -72,17 +77,24 @@ func main() {
 	defer stop()
 	go gw.pollLoop(ctx)
 
+	verifier := auth.NewVerifier(os.Getenv("OIDC_ISSUER"))
+
 	r := chi.NewRouter()
+	// Unauthenticated ops endpoints.
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	r.Handle("/metrics", promhttp.Handler())
-	r.Get("/api/v1/clients", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, reg.Names())
+	// /api/* requires a valid bearer when OIDC_ISSUER is set (else pass-through).
+	r.Group(func(r chi.Router) {
+		r.Use(verifier.Middleware)
+		r.Get("/api/v1/clients", func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, http.StatusOK, reg.Names())
+		})
+		r.Post("/api/v1/downloads", gw.handleAdd)
+		r.Delete("/api/v1/downloads/{adapter}/{id}", gw.handleRemove)
+		r.Get("/api/v1/downloads", gw.handleList)
 	})
-	r.Post("/api/v1/downloads", gw.handleAdd)
-	r.Delete("/api/v1/downloads/{adapter}/{id}", gw.handleRemove)
-	r.Get("/api/v1/downloads", gw.handleList)
 
 	srv := &http.Server{Addr: addr, Handler: r, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
