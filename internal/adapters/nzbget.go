@@ -81,9 +81,10 @@ func (n *NZBGet) Add(ctx context.Context, j Job) (string, error) {
 		name = "download"
 	}
 	// append(NZBFilename, NZBContent(URL|base64), Category, Priority, AddToTop,
-	//        AddPaused, DupeKey, DupeScore, DupeMode)
+	//        AddPaused, DupeKey, DupeScore, DupeMode). DupeMode must be a valid
+	// enum — FORCE always adds (a request should never be silently deduped away).
 	res, err := n.call(ctx, "append",
-		name+".nzb", j.Source, n.Category, 0, false, false, "", 0, "")
+		name+".nzb", j.Source, n.Category, 0, false, false, "", 0, "FORCE")
 	if err != nil {
 		return "", err
 	}
