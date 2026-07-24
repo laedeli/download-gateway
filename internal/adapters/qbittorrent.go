@@ -67,8 +67,11 @@ func (q *QBittorrent) get(ctx context.Context, path string, query url.Values) (*
 	return q.HTTP.Do(req)
 }
 
-// login mints a fresh SID cookie. qB returns 200 "Ok." on success, 403 "Fails."
-// on bad credentials.
+// login mints a fresh SID cookie. qB returns 200 "Ok." on success and 403
+// "Fails." on bad credentials. When the WebUI subnet whitelist is enabled the
+// caller is pre-authenticated, so login can return 200 without "Ok." or 204 No
+// Content and no SID cookie — all of which are success (subsequent API calls
+// work without a session). Only a 403 (or other non-2xx) is a real failure.
 func (q *QBittorrent) login(ctx context.Context) error {
 	resp, err := q.post(ctx, "/api/v2/auth/login", url.Values{
 		"username": {q.Username}, "password": {q.Password},
@@ -78,7 +81,7 @@ func (q *QBittorrent) login(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-	if resp.StatusCode != http.StatusOK || strings.TrimSpace(string(body)) != "Ok." {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("qbittorrent login failed: %d %q", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return nil
