@@ -1,0 +1,13 @@
+# Public-base build for GitHub Actions → ghcr.io/laedeli/download-gateway.
+# (The GitLab CI build uses the private-mirror Dockerfile; this one stays public.)
+FROM golang:1.24 AS build
+WORKDIR /src
+COPY go.mod go.sum* ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" -o /download-gateway ./cmd/server
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /download-gateway /download-gateway
+EXPOSE 8080
+ENTRYPOINT ["/download-gateway"]
