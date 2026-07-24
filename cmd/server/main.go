@@ -57,6 +57,11 @@ func main() {
 			os.Getenv("QBITTORRENT_USER"), os.Getenv("QBITTORRENT_PASS")))
 		slog.Info("qbittorrent adapter configured", "base_url", base)
 	}
+	if base := os.Getenv("NZBGET_URL"); base != "" {
+		configured = append(configured, adapters.NewNZBGet(base,
+			os.Getenv("NZBGET_USER"), os.Getenv("NZBGET_PASS"), os.Getenv("NZBGET_CATEGORY")))
+		slog.Info("nzbget adapter configured", "base_url", base)
+	}
 	reg := adapters.NewRegistry(configured...)
 
 	pub, err := events.NewPublisher(events.ConfigFromEnv())
