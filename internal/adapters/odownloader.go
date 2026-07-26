@@ -137,8 +137,11 @@ func (o *ODownloader) Describe(ctx context.Context, packageID string) (JobView, 
 // otherwise it is downloading (or queued if nothing has started).
 func foldODL(links []odlDownloadView) JobView {
 	if len(links) == 0 {
+		// The package is gone (or never had links): report "not found" so the
+		// gateway can eventually stop tracking it.
 		jv := NewJobView()
 		jv.State = StatusQueued
+		jv.NativeState = NotFoundState
 		return jv
 	}
 	jv := NewJobView()
@@ -156,6 +159,9 @@ func foldODL(links []odlDownloadView) JobView {
 		}
 		if l.Message != "" {
 			jv.Message = l.Message
+		}
+		if jv.NativeState == "" {
+			jv.NativeState = l.State
 		}
 		if l.OutputPath != "" {
 			files = append(files, l.OutputPath)

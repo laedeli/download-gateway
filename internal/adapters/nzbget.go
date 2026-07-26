@@ -145,73 +145,95 @@ func (n *NZBGet) Status(ctx context.Context, id string) (Status, error) {
 	return v.State, nil
 }
 
+// foldNZBGroup maps one active-queue entry to a JobView.
+func foldNZBGroup(g nzbGroup) JobView {
+	remaining := exact64(g.RemainingSizeLo, g.RemainingSizeHi, g.RemainingSizeMB)
+	v := NewJobView()
+	v.Title = g.NZBName
+	v.NativeState = g.Status
+	v.BytesDone = exact64(g.DownloadedSizeLo, g.DownloadedSizeHi, g.DownloadedSizeMB)
+	v.BytesTotal = exact64(g.FileSizeLo, g.FileSizeHi, g.FileSizeMB)
+	v.SpeedBps = g.DownloadRate
+	v.Health = g.Health
+	if g.DownloadRate > 0 {
+		v.EtaSec = remaining / g.DownloadRate
+	}
+	// Everything in the queue is "not done yet", but keep the native status so a
+	// console can show paused / repairing / unpacking.
+	v.State = StatusDownloading
+	if g.Status == "QUEUED" || g.Status == "PAUSED" {
+		v.State = StatusQueued
+	}
+	return v
+}
+
+// foldNZBHistory maps one history entry to a terminal JobView.
+func foldNZBHistory(h nzbHistory) JobView {
+	v := NewJobView()
+	v.Title = h.Name
+	v.NativeState = h.Status
+	v.BytesTotal = h.FileSizeMB * 1024 * 1024
+	switch {
+	case strings.HasPrefix(h.Status, "SUCCESS"):
+		v.State = StatusCompleted
+		v.BytesDone = v.BytesTotal
+		if h.DestDir != "" {
+			v.Files = []string{h.DestDir}
+		}
+	case strings.HasPrefix(h.Status, "DELETED"):
+		v.State = StatusFailed
+		v.Message = "removed: " + h.Status
+	default: // FAILURE/…, WARNING/…
+		v.State = StatusFailed
+		v.Message = "nzbget: " + h.Status
+	}
+	return v
+}
+
 // Describe folds the active queue (listgroups) then history into a JobView.
+//
+// A transport/RPC failure must surface as an error, NOT as the "job is not
+// there" answer: the gateway treats a persistently unknown job as lost and
+// gives up on it, so swallowing an outage here would delete live downloads.
 func (n *NZBGet) Describe(ctx context.Context, id string) (JobView, error) {
 	want, _ := strconv.Atoi(id)
 
-	if res, err := n.call(ctx, "listgroups", 0); err == nil {
+	res, listErr := n.call(ctx, "listgroups", 0)
+	if listErr == nil {
 		var groups []nzbGroup
-		if json.Unmarshal(res, &groups) == nil {
+		if listErr = json.Unmarshal(res, &groups); listErr == nil {
 			for _, g := range groups {
-				if g.NZBID != want {
-					continue
+				if g.NZBID == want {
+					return foldNZBGroup(g), nil
 				}
-				remaining := exact64(g.RemainingSizeLo, g.RemainingSizeHi, g.RemainingSizeMB)
-				v := NewJobView()
-				v.Title = g.NZBName
-				v.NativeState = g.Status
-				v.BytesDone = exact64(g.DownloadedSizeLo, g.DownloadedSizeHi, g.DownloadedSizeMB)
-				v.BytesTotal = exact64(g.FileSizeLo, g.FileSizeHi, g.FileSizeMB)
-				v.SpeedBps = g.DownloadRate
-				v.Health = g.Health
-				if g.DownloadRate > 0 {
-					v.EtaSec = remaining / g.DownloadRate
-				}
-				// Everything in the queue is "not done yet", but keep the native
-				// status so a console can show paused / repairing / unpacking.
-				v.State = StatusDownloading
-				if g.Status == "QUEUED" || g.Status == "PAUSED" {
-					v.State = StatusQueued
-				}
-				return v, nil
 			}
 		}
 	}
 
-	if res, err := n.call(ctx, "history", false); err == nil {
+	res, histErr := n.call(ctx, "history", false)
+	if histErr == nil {
 		var hist []nzbHistory
-		if json.Unmarshal(res, &hist) == nil {
+		if histErr = json.Unmarshal(res, &hist); histErr == nil {
 			for _, h := range hist {
-				if h.NZBID != want {
-					continue
+				if h.NZBID == want {
+					return foldNZBHistory(h), nil
 				}
-				v := NewJobView()
-				v.Title = h.Name
-				v.NativeState = h.Status
-				v.BytesTotal = h.FileSizeMB * 1024 * 1024
-				switch {
-				case strings.HasPrefix(h.Status, "SUCCESS"):
-					v.State = StatusCompleted
-					v.BytesDone = v.BytesTotal
-					if h.DestDir != "" {
-						v.Files = []string{h.DestDir}
-					}
-				case strings.HasPrefix(h.Status, "DELETED"):
-					v.State = StatusFailed
-					v.Message = "removed: " + h.Status
-				default: // FAILURE/…, WARNING/…
-					v.State = StatusFailed
-					v.Message = "nzbget: " + h.Status
-				}
-				return v, nil
 			}
 		}
 	}
 
-	// Accepted but not yet visible in either list.
+	// Only claim "not there" when we actually got both lists back.
+	if listErr != nil || histErr != nil {
+		err := listErr
+		if err == nil {
+			err = histErr
+		}
+		return JobView{}, fmt.Errorf("nzbget describe %s: %w", id, err)
+	}
+
 	v := NewJobView()
 	v.State = StatusQueued
-	v.NativeState = "pending"
+	v.NativeState = NotFoundState
 	return v, nil
 }
 
@@ -284,9 +306,17 @@ func (n *NZBGet) ClientStatus(ctx context.Context) ClientStatus {
 	return cs
 }
 
-// Adopt re-discovers this gateway's jobs after a restart: everything in our
-// category that is still in the queue, plus anything already in history.
+// Adopt re-discovers this gateway's still-running jobs after a restart: the
+// groups in our category that are still in the queue. History is deliberately
+// NOT adopted — those jobs already reached a terminal state, and re-adopting
+// them would replay a completed/failed event on every restart.
+//
+// Ownership is the category, so without one we cannot tell our downloads from
+// anyone else's and adopt nothing rather than hijacking the whole queue.
 func (n *NZBGet) Adopt(ctx context.Context) ([]AdoptedJob, error) {
+	if n.Category == "" {
+		return nil, nil
+	}
 	var out []AdoptedJob
 	res, err := n.call(ctx, "listgroups", 0)
 	if err != nil {
@@ -301,7 +331,7 @@ func (n *NZBGet) Adopt(ctx context.Context) ([]AdoptedJob, error) {
 		return nil, err
 	}
 	for _, g := range groups {
-		if n.Category != "" && g.Category != n.Category {
+		if g.Category != n.Category {
 			continue
 		}
 		out = append(out, AdoptedJob{ClientJobID: strconv.Itoa(g.NZBID), Title: g.NZBName})

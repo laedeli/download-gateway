@@ -45,6 +45,12 @@ type JobView struct {
 	Health   int32 // usenet article health, 0-1000; -1 when N/A
 }
 
+// NotFoundState is the NativeState an adapter reports when the client answered
+// successfully but has never heard of this job. The gateway uses it to give up
+// on jobs that were deleted out from under it — so an adapter must NOT return it
+// for a transport error, or a client outage would look like mass deletion.
+const NotFoundState = "not-found"
+
 // NewJobView returns a JobView with the "not reported" sentinels set, so an
 // adapter only fills in what its client actually gives it.
 func NewJobView() JobView {

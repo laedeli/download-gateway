@@ -33,7 +33,7 @@ func TestExact64AboveFourGiB(t *testing.T) {
 
 // A queued or paused group must not be reported as actively downloading — the
 // console distinguishes them, and the old fold hard-coded "downloading".
-func TestFoldNZBGetQueuedStates(t *testing.T) {
+func TestFoldNZBGroupStates(t *testing.T) {
 	for _, tc := range []struct {
 		status string
 		want   Status
@@ -42,18 +42,57 @@ func TestFoldNZBGetQueuedStates(t *testing.T) {
 		{"QUEUED", StatusQueued},
 		{"PAUSED", StatusQueued},
 		{"REPAIRING", StatusDownloading},
+		{"UNPACKING", StatusDownloading},
 	} {
-		v := NewJobView()
-		v.NativeState = tc.status
-		v.State = StatusDownloading
-		if tc.status == "QUEUED" || tc.status == "PAUSED" {
-			v.State = StatusQueued
-		}
+		v := foldNZBGroup(nzbGroup{NZBID: 1, NZBName: "x", Status: tc.status})
 		if v.State != tc.want {
 			t.Errorf("status %q folded to %q, want %q", tc.status, v.State, tc.want)
 		}
 		if v.NativeState != tc.status {
-			t.Errorf("native state lost for %q", tc.status)
+			t.Errorf("native state lost for %q: got %q", tc.status, v.NativeState)
+		}
+	}
+}
+
+// The group fold must use the exact byte pair and compute an ETA from the rate.
+func TestFoldNZBGroupTelemetry(t *testing.T) {
+	const total = int64(6) << 30 // 6 GiB
+	const done = int64(2) << 30
+	g := nzbGroup{
+		Status:           "DOWNLOADING",
+		FileSizeLo:       total & 0xFFFFFFFF,
+		FileSizeHi:       total >> 32,
+		DownloadedSizeLo: done & 0xFFFFFFFF,
+		DownloadedSizeHi: done >> 32,
+		RemainingSizeLo:  (total - done) & 0xFFFFFFFF,
+		RemainingSizeHi:  (total - done) >> 32,
+		DownloadRate:     1 << 20, // 1 MiB/s
+		Health:           980,
+	}
+	v := foldNZBGroup(g)
+	if v.BytesTotal != total || v.BytesDone != done {
+		t.Fatalf("bytes = %d/%d, want %d/%d", v.BytesDone, v.BytesTotal, done, total)
+	}
+	if v.EtaSec != (total-done)/(1<<20) {
+		t.Errorf("eta = %d", v.EtaSec)
+	}
+	if v.Health != 980 {
+		t.Errorf("health = %d, want 980", v.Health)
+	}
+}
+
+// History drives the terminal states acquire reacts to.
+func TestFoldNZBHistory(t *testing.T) {
+	ok := foldNZBHistory(nzbHistory{Status: "SUCCESS/ALL", DestDir: "/data/x", FileSizeMB: 10})
+	if ok.State != StatusCompleted || len(ok.Files) != 1 || ok.Files[0] != "/data/x" {
+		t.Fatalf("success fold = %+v", ok)
+	}
+	if ok.BytesDone != ok.BytesTotal {
+		t.Errorf("a completed job should report full bytes: %d/%d", ok.BytesDone, ok.BytesTotal)
+	}
+	for _, st := range []string{"FAILURE/PAR", "WARNING/HEALTH", "DELETED/MANUAL"} {
+		if v := foldNZBHistory(nzbHistory{Status: st}); v.State != StatusFailed {
+			t.Errorf("%q folded to %q, want failed", st, v.State)
 		}
 	}
 }
