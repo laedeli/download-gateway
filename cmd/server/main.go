@@ -29,6 +29,10 @@ type tracked struct {
 	wantedItemID string
 	last         adapters.Status
 	view         adapters.JobView // newest snapshot, for GET /api/v1/downloads
+	// Previous byte sample, used to derive a transfer rate for clients that do
+	// not report one (NZBGet's listgroups has no per-group DownloadRate).
+	lastBytes int64
+	lastAt    time.Time
 	// missingSince is when the client stopped reporting this job at all. A job
 	// deleted out from under us folds to "queued" forever otherwise, so we give
 	// up on it after lostAfter.
@@ -377,6 +381,8 @@ func (g *gateway) pollOne(ctx context.Context, job *tracked) {
 		} else {
 			g.clearMissing(job)
 		}
+		pb, pt := g.prevSample(job)
+		fillDerived(&v, pb, pt)
 		_ = g.pub.EmitProgress(ctx, events.Progress{
 			ClientID: job.clientJobID, Adapter: job.adapter,
 			WantedItemID:    job.wantedItemID,
@@ -405,14 +411,42 @@ func titleOf(job *tracked, v adapters.JobView) string {
 	return job.title
 }
 
-// observe records the newest state + snapshot for the list endpoint.
+// observe records the newest state + snapshot for the list endpoint, and the
+// byte sample the next tick derives a rate from.
 func (g *gateway) observe(job *tracked, v adapters.JobView) {
 	g.mu.Lock()
 	if cur := g.jobs[job.adapter+":"+job.clientJobID]; cur != nil {
 		cur.last = v.State
 		cur.view = v
+		cur.lastBytes = v.BytesDone
+		cur.lastAt = time.Now()
 	}
 	g.mu.Unlock()
+}
+
+// prevSample returns the previous byte count + when it was taken.
+func (g *gateway) prevSample(job *tracked) (int64, time.Time) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if cur := g.jobs[job.adapter+":"+job.clientJobID]; cur != nil {
+		return cur.lastBytes, cur.lastAt
+	}
+	return 0, time.Time{}
+}
+
+// fillDerived computes the values a client did not report: a transfer rate from
+// the byte delta since the previous poll, and an ETA from that rate. NZBGet's
+// listgroups carries no per-group DownloadRate at all, so without this a usenet
+// download shows no speed and no ETA.
+func fillDerived(v *adapters.JobView, prevBytes int64, prevAt time.Time) {
+	if v.SpeedBps <= 0 && !prevAt.IsZero() && v.BytesDone > prevBytes {
+		if elapsed := time.Since(prevAt).Seconds(); elapsed >= 1 {
+			v.SpeedBps = int64(float64(v.BytesDone-prevBytes) / elapsed)
+		}
+	}
+	if v.EtaSec < 0 && v.SpeedBps > 0 && v.BytesTotal > v.BytesDone {
+		v.EtaSec = (v.BytesTotal - v.BytesDone) / v.SpeedBps
+	}
 }
 
 // markMissing starts (or checks) the grace window for a job the client can no
