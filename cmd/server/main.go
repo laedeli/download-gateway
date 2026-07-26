@@ -165,6 +165,7 @@ func (g *gateway) handleAdd(w http.ResponseWriter, r *http.Request) {
 	g.track(&tracked{
 		adapter: req.Adapter, clientJobID: clientJobID,
 		title: req.Title, wantedItemID: req.WantedItemID, last: adapters.StatusQueued,
+		view: adapters.NewJobView(),
 	})
 	_ = g.pub.EmitStarted(r.Context(), events.Started{
 		ClientID: clientJobID, Adapter: req.Adapter, WantedItemID: req.WantedItemID, Title: req.Title,
@@ -264,7 +265,10 @@ func (g *gateway) handleClientStatus(w http.ResponseWriter, r *http.Request) {
 	for _, name := range names {
 		rep, ok := g.reg.Get(name).(adapters.Reporter)
 		if !ok {
-			out = append(out, adapters.ClientStatus{Name: name, Reachable: true})
+			// Don't invent health we never measured.
+			out = append(out, adapters.ClientStatus{
+				Name: name, Error: "status not supported by this adapter",
+			})
 			continue
 		}
 		cctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
@@ -359,7 +363,7 @@ func (g *gateway) pollOne(ctx context.Context, job *tracked) {
 	default:
 		// A job the client no longer knows about reports as "pending"/queued
 		// forever. Give it a grace window, then stop tracking it.
-		if v.NativeState == "pending" {
+		if v.NativeState == adapters.NotFoundState {
 			if g.markMissing(job) {
 				slog.Warn("job vanished from client; dropping",
 					"adapter", job.adapter, "id", job.clientJobID)
@@ -458,6 +462,7 @@ func (g *gateway) adoptExisting(ctx context.Context) {
 			g.track(&tracked{
 				adapter: name, clientJobID: j.ClientJobID,
 				title: j.Title, last: adapters.StatusQueued,
+				view: adapters.NewJobView(),
 			})
 		}
 		if len(jobs) > 0 {

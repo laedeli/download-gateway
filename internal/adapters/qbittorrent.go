@@ -211,7 +211,7 @@ func (q *QBittorrent) Describe(ctx context.Context, tag string) (JobView, error)
 		// Accepted but not yet visible (metadata fetch) — report queued.
 		v := NewJobView()
 		v.State = StatusQueued
-		v.NativeState = "pending"
+		v.NativeState = NotFoundState
 		return v, nil
 	}
 	return foldQB(t), nil
@@ -352,6 +352,10 @@ func (q *QBittorrent) ClientStatus(ctx context.Context) ClientStatus {
 // Adopt re-discovers gateway-owned torrents after a restart. Every job we add
 // carries a "dlg-" tag, which is also its clientJobID — so the tag list is the
 // job list.
+//
+// Finished torrents keep their tag and keep seeding forever, so they are
+// skipped: re-adopting one would fold to Completed on the next poll and replay
+// a completed event (re-triggering ingest) on every restart.
 func (q *QBittorrent) Adopt(ctx context.Context) ([]AdoptedJob, error) {
 	resp, err := q.authed(ctx, func() (*http.Response, error) {
 		return q.get(ctx, "/api/v2/torrents/info", nil)
@@ -369,6 +373,9 @@ func (q *QBittorrent) Adopt(ctx context.Context) ([]AdoptedJob, error) {
 	}
 	var out []AdoptedJob
 	for _, t := range list {
+		if v := foldQB(t); v.State == StatusCompleted || v.State == StatusFailed {
+			continue // already terminal — do not replay its event
+		}
 		for _, tag := range strings.Split(t.Tags, ",") {
 			if tag = strings.TrimSpace(tag); strings.HasPrefix(tag, jobTagPrefix) {
 				out = append(out, AdoptedJob{ClientJobID: tag, Title: t.Name})
