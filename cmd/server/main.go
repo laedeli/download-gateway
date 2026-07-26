@@ -28,7 +28,20 @@ type tracked struct {
 	title        string
 	wantedItemID string
 	last         adapters.Status
+	view         adapters.JobView // newest snapshot, for GET /api/v1/downloads
+	// missingSince is when the client stopped reporting this job at all. A job
+	// deleted out from under us folds to "queued" forever otherwise, so we give
+	// up on it after lostAfter.
+	missingSince time.Time
 }
+
+// lostAfter is how long a job may stay invisible to its client before the
+// gateway declares it lost and stops tracking it.
+const lostAfter = 10 * time.Minute
+
+// pollConcurrency bounds the per-tick fan-out. The loop used to poll serially,
+// so one slow client stalled every other job's updates.
+const pollConcurrency = 8
 
 type gateway struct {
 	reg  *adapters.Registry
@@ -80,6 +93,9 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	// Re-attach to downloads that were already running before this process
+	// started, then begin polling.
+	gw.adoptExisting(ctx)
 	go gw.pollLoop(ctx)
 
 	verifier := auth.NewVerifier(os.Getenv("OIDC_ISSUER"))
@@ -96,9 +112,12 @@ func main() {
 		r.Get("/api/v1/clients", func(w http.ResponseWriter, _ *http.Request) {
 			writeJSON(w, http.StatusOK, reg.Names())
 		})
+		r.Get("/api/v1/clients/status", gw.handleClientStatus)
 		r.Post("/api/v1/downloads", gw.handleAdd)
 		r.Delete("/api/v1/downloads/{adapter}/{id}", gw.handleRemove)
 		r.Get("/api/v1/downloads", gw.handleList)
+		r.Post("/api/v1/downloads/{adapter}/{id}/pause", gw.handleControl("pause"))
+		r.Post("/api/v1/downloads/{adapter}/{id}/resume", gw.handleControl("resume"))
 	})
 
 	srv := &http.Server{Addr: addr, Handler: r, ReadHeaderTimeout: 5 * time.Second}
@@ -169,16 +188,89 @@ func (g *gateway) handleRemove(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// jobDTO is one in-flight job as reported by GET /api/v1/downloads. It carries
+// the last polled snapshot so a console can render progress without asking each
+// client again (and so acquire can reconcile after its own restart).
+type jobDTO struct {
+	Adapter      string  `json:"adapter"`
+	ClientJobID  string  `json:"client_job_id"`
+	WantedItemID string  `json:"wanted_item_id,omitempty"`
+	Title        string  `json:"title"`
+	State        string  `json:"state"`
+	NativeState  string  `json:"native_state,omitempty"`
+	ProgressPct  float64 `json:"progress_pct"`
+	Downloaded   int64   `json:"downloaded_bytes"`
+	SizeBytes    *int64  `json:"size_bytes"`
+	SpeedBps     int64   `json:"speed_bps"`
+	EtaSec       *int32  `json:"eta_sec"`
+	Seeders      *int32  `json:"seeders,omitempty"`
+	Leechers     *int32  `json:"leechers,omitempty"`
+	Health       *int32  `json:"health,omitempty"`
+}
+
 func (g *gateway) handleList(w http.ResponseWriter, _ *http.Request) {
 	g.mu.Lock()
-	out := make([]map[string]string, 0, len(g.jobs))
+	out := make([]jobDTO, 0, len(g.jobs))
 	for _, t := range g.jobs {
-		out = append(out, map[string]string{
-			"adapter": t.adapter, "client_job_id": t.clientJobID,
-			"title": t.title, "state": string(t.last),
+		v := t.view
+		out = append(out, jobDTO{
+			Adapter: t.adapter, ClientJobID: t.clientJobID, WantedItemID: t.wantedItemID,
+			Title: titleOf(t, v), State: string(t.last), NativeState: v.NativeState,
+			ProgressPct: pct(v.BytesDone, v.BytesTotal), Downloaded: v.BytesDone,
+			SizeBytes: optInt64(v.BytesTotal), SpeedBps: v.SpeedBps,
+			EtaSec:  optInt32(v.EtaSec),
+			Seeders: optCount(v.Seeders), Leechers: optCount(v.Leechers), Health: optCount(v.Health),
 		})
 	}
 	g.mu.Unlock()
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleControl pauses or resumes one job, for adapters that support it.
+func (g *gateway) handleControl(action string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		name := chi.URLParam(r, "adapter")
+		id := chi.URLParam(r, "id")
+		ad := g.reg.Get(name)
+		if ad == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such adapter"})
+			return
+		}
+		ctrl, ok := ad.(adapters.Controller)
+		if !ok {
+			writeJSON(w, http.StatusNotImplemented,
+				map[string]string{"error": name + " cannot " + action})
+			return
+		}
+		var err error
+		if action == "pause" {
+			err = ctrl.Pause(r.Context(), id)
+		} else {
+			err = ctrl.Resume(r.Context(), id)
+		}
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// handleClientStatus reports per-client health + aggregate speed, so a console
+// can show "qBittorrent 4.2 MB/s · nzbget 18 MB/s, 2/2 news servers".
+func (g *gateway) handleClientStatus(w http.ResponseWriter, r *http.Request) {
+	names := g.reg.Names()
+	out := make([]adapters.ClientStatus, 0, len(names))
+	for _, name := range names {
+		rep, ok := g.reg.Get(name).(adapters.Reporter)
+		if !ok {
+			out = append(out, adapters.ClientStatus{Name: name, Reachable: true})
+			continue
+		}
+		cctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		out = append(out, rep.ClientStatus(cctx))
+		cancel()
+	}
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -216,11 +308,27 @@ func (g *gateway) pollLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			for _, job := range g.snapshot() {
-				g.pollOne(ctx, job)
-			}
+			g.pollAll(ctx)
 		}
 	}
+}
+
+// pollAll polls every tracked job with bounded concurrency, so one slow client
+// cannot delay the others' updates.
+func (g *gateway) pollAll(ctx context.Context) {
+	jobs := g.snapshot()
+	sem := make(chan struct{}, pollConcurrency)
+	var wg sync.WaitGroup
+	for _, job := range jobs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(j *tracked) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			g.pollOne(ctx, j)
+		}(job)
+	}
+	wg.Wait()
 }
 
 func (g *gateway) pollOne(ctx context.Context, job *tracked) {
@@ -244,28 +352,118 @@ func (g *gateway) pollOne(ctx context.Context, job *tracked) {
 		g.untrack(job.adapter, job.clientJobID)
 	case adapters.StatusFailed:
 		_ = g.pub.EmitFailed(ctx, events.Failed{
-			ClientID: job.clientJobID, Adapter: job.adapter, Error: v.Message,
+			ClientID: job.clientJobID, Adapter: job.adapter, WantedItemID: job.wantedItemID,
+			Title: titleOf(job, v), Error: v.Message,
 		})
 		g.untrack(job.adapter, job.clientJobID)
 	default:
+		// A job the client no longer knows about reports as "pending"/queued
+		// forever. Give it a grace window, then stop tracking it.
+		if v.NativeState == "pending" {
+			if g.markMissing(job) {
+				slog.Warn("job vanished from client; dropping",
+					"adapter", job.adapter, "id", job.clientJobID)
+				_ = g.pub.EmitFailed(ctx, events.Failed{
+					ClientID: job.clientJobID, Adapter: job.adapter, WantedItemID: job.wantedItemID,
+					Title: job.title, Error: "job is no longer known to " + job.adapter,
+				})
+				g.untrack(job.adapter, job.clientJobID)
+				return
+			}
+		} else {
+			g.clearMissing(job)
+		}
 		_ = g.pub.EmitProgress(ctx, events.Progress{
-			ClientID: job.clientJobID, Adapter: job.adapter, State: string(v.State),
+			ClientID: job.clientJobID, Adapter: job.adapter,
+			WantedItemID:    job.wantedItemID,
+			Title:           titleOf(job, v),
+			State:           string(v.State),
+			NativeState:     v.NativeState,
 			ProgressPct:     pct(v.BytesDone, v.BytesTotal),
 			DownloadedBytes: v.BytesDone,
 			SizeBytes:       optInt64(v.BytesTotal),
-			SpeedBps:        optInt64(v.SpeedBps),
+			SpeedBps:        v.SpeedBps,
 			EtaSec:          optInt32(v.EtaSec),
+			Seeders:         optCount(v.Seeders),
+			Leechers:        optCount(v.Leechers),
+			Health:          optCount(v.Health),
 		})
-		g.setLast(job, v.State)
+		g.observe(job, v)
 	}
 }
 
-func (g *gateway) setLast(job *tracked, s adapters.Status) {
+// titleOf prefers the client's own title, falling back to what the caller
+// supplied at add time (magnets have no name until metadata resolves).
+func titleOf(job *tracked, v adapters.JobView) string {
+	if v.Title != "" {
+		return v.Title
+	}
+	return job.title
+}
+
+// observe records the newest state + snapshot for the list endpoint.
+func (g *gateway) observe(job *tracked, v adapters.JobView) {
 	g.mu.Lock()
 	if cur := g.jobs[job.adapter+":"+job.clientJobID]; cur != nil {
-		cur.last = s
+		cur.last = v.State
+		cur.view = v
 	}
 	g.mu.Unlock()
+}
+
+// markMissing starts (or checks) the grace window for a job the client can no
+// longer see; it returns true once the job should be given up on.
+func (g *gateway) markMissing(job *tracked) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	cur := g.jobs[job.adapter+":"+job.clientJobID]
+	if cur == nil {
+		return false
+	}
+	if cur.missingSince.IsZero() {
+		cur.missingSince = time.Now()
+		return false
+	}
+	return time.Since(cur.missingSince) > lostAfter
+}
+
+func (g *gateway) clearMissing(job *tracked) {
+	g.mu.Lock()
+	if cur := g.jobs[job.adapter+":"+job.clientJobID]; cur != nil {
+		cur.missingSince = time.Time{}
+	}
+	g.mu.Unlock()
+}
+
+// adoptExisting re-attaches to jobs still running in the clients after a
+// restart. The tracked map is in-memory only, so without this an in-flight
+// download is orphaned: it keeps downloading but never emits progress, and its
+// completion is never seen.
+func (g *gateway) adoptExisting(ctx context.Context) {
+	for _, name := range g.reg.Names() {
+		ad, ok := g.reg.Get(name).(adapters.Rehydrator)
+		if !ok {
+			continue
+		}
+		actx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		jobs, err := ad.Adopt(actx)
+		cancel()
+		if err != nil {
+			slog.Warn("adopt failed", "adapter", name, "err", err)
+			continue
+		}
+		for _, j := range jobs {
+			// wantedItemID is unknown after a restart; acquire re-associates by
+			// (adapter, client_job_id) from its own grabs table.
+			g.track(&tracked{
+				adapter: name, clientJobID: j.ClientJobID,
+				title: j.Title, last: adapters.StatusQueued,
+			})
+		}
+		if len(jobs) > 0 {
+			slog.Info("adopted in-flight jobs after restart", "adapter", name, "count", len(jobs))
+		}
+	}
 }
 
 func pct(done, total int64) float64 {
@@ -288,6 +486,15 @@ func optInt32(v int64) *int32 {
 	}
 	x := int32(v)
 	return &x
+}
+
+// optCount maps an adapter's "not reported" sentinel (-1) to a nil pointer, so
+// a missing seed count is absent from the event rather than a misleading 0.
+func optCount(v int32) *int32 {
+	if v < 0 {
+		return nil
+	}
+	return &v
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

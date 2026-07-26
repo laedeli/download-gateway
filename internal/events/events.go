@@ -52,15 +52,28 @@ type Started struct {
 }
 
 type Progress struct {
-	ClientID        string  `json:"client_id"`
-	Adapter         string  `json:"adapter"`
-	State           string  `json:"state"`
+	ClientID     string `json:"client_id"`
+	Adapter      string `json:"adapter"`
+	WantedItemID string `json:"wanted_item_id,omitempty"`
+	Title        string `json:"title,omitempty"`
+	State        string `json:"state"`
+	// NativeState is the download client's own state string (qBittorrent
+	// "stalledDL"/"pausedDL"/"metaDL", NZBGet "PAUSED"/"REPAIRING"/…). State is
+	// the coarse fold; this is what a console shows a human.
+	NativeState     string  `json:"native_state,omitempty"`
 	ProgressPct     float64 `json:"progress_pct"`
 	DownloadedBytes int64   `json:"downloaded_bytes"`
 	SizeBytes       *int64  `json:"size_bytes"`
-	SpeedBps        *int64  `json:"speed_bps"`
-	EtaSec          *int32  `json:"eta_sec"`
-	EmittedAt       int64   `json:"emitted_at"`
+	// SpeedBps is always present: 0 means "idle", not "unknown". (Size and eta
+	// keep pointer semantics because those genuinely can be unknown.)
+	SpeedBps int64  `json:"speed_bps"`
+	EtaSec   *int32 `json:"eta_sec"`
+	// Peers/health, when the client reports them (torrents: seeds/peers/ratio;
+	// usenet: article health 0-1000).
+	Seeders   *int32 `json:"seeders,omitempty"`
+	Leechers  *int32 `json:"leechers,omitempty"`
+	Health    *int32 `json:"health,omitempty"`
+	EmittedAt int64  `json:"emitted_at"`
 }
 
 type Completed struct {
@@ -73,12 +86,14 @@ type Completed struct {
 }
 
 type Failed struct {
-	ClientID  string `json:"client_id"`
-	Adapter   string `json:"adapter"`
-	Error     string `json:"error"`
-	ErrorCode string `json:"error_code,omitempty"`
-	Retriable bool   `json:"retriable"`
-	FailedAt  int64  `json:"failed_at"`
+	ClientID     string `json:"client_id"`
+	Adapter      string `json:"adapter"`
+	WantedItemID string `json:"wanted_item_id,omitempty"`
+	Title        string `json:"title,omitempty"`
+	Error        string `json:"error"`
+	ErrorCode    string `json:"error_code,omitempty"`
+	Retriable    bool   `json:"retriable"`
+	FailedAt     int64  `json:"failed_at"`
 }
 
 // Publisher wraps sarama.SyncProducer. A nil internal producer means

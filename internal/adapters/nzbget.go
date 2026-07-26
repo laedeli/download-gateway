@@ -100,13 +100,33 @@ func (n *NZBGet) Add(ctx context.Context, j Job) (string, error) {
 }
 
 type nzbGroup struct {
-	NZBID            int    `json:"NZBID"`
-	NZBName          string `json:"NZBName"`
-	Status           string `json:"Status"`
-	FileSizeMB       int64  `json:"FileSizeMB"`
-	DownloadedSizeMB int64  `json:"DownloadedSizeMB"`
-	RemainingSizeMB  int64  `json:"RemainingSizeMB"`
-	DownloadRate     int64  `json:"DownloadRate"` // bytes/sec
+	NZBID   int    `json:"NZBID"`
+	NZBName string `json:"NZBName"`
+	Status  string `json:"Status"`
+	// NZBGet reports every size twice: an MB-rounded field and an exact 64-bit
+	// Lo/Hi pair. Use the exact pair so progress doesn't jump in 1 MiB steps.
+	FileSizeMB        int64 `json:"FileSizeMB"`
+	FileSizeLo        int64 `json:"FileSizeLo"`
+	FileSizeHi        int64 `json:"FileSizeHi"`
+	DownloadedSizeMB  int64 `json:"DownloadedSizeMB"`
+	DownloadedSizeLo  int64 `json:"DownloadedSizeLo"`
+	DownloadedSizeHi  int64 `json:"DownloadedSizeHi"`
+	RemainingSizeMB   int64 `json:"RemainingSizeMB"`
+	RemainingSizeLo   int64 `json:"RemainingSizeLo"`
+	RemainingSizeHi   int64 `json:"RemainingSizeHi"`
+	DownloadRate      int64 `json:"DownloadRate"` // bytes/sec
+	Health            int32 `json:"Health"`       // 0-1000
+	CriticalHealth    int32 `json:"CriticalHealth"`
+	PostStageProgress int32 `json:"PostStageProgress"`
+}
+
+// exact64 rebuilds a 64-bit size from NZBGet's Lo/Hi pair, falling back to the
+// MB-rounded value when the pair is absent.
+func exact64(lo, hi, mb int64) int64 {
+	if v := hi<<32 | (lo & 0xFFFFFFFF); v > 0 {
+		return v
+	}
+	return mb * 1024 * 1024
 }
 
 type nzbHistory struct {
@@ -136,17 +156,23 @@ func (n *NZBGet) Describe(ctx context.Context, id string) (JobView, error) {
 				if g.NZBID != want {
 					continue
 				}
-				v := JobView{
-					Title:      g.NZBName,
-					BytesDone:  g.DownloadedSizeMB * 1024 * 1024,
-					BytesTotal: g.FileSizeMB * 1024 * 1024,
-					SpeedBps:   g.DownloadRate,
-					EtaSec:     -1,
-				}
+				remaining := exact64(g.RemainingSizeLo, g.RemainingSizeHi, g.RemainingSizeMB)
+				v := NewJobView()
+				v.Title = g.NZBName
+				v.NativeState = g.Status
+				v.BytesDone = exact64(g.DownloadedSizeLo, g.DownloadedSizeHi, g.DownloadedSizeMB)
+				v.BytesTotal = exact64(g.FileSizeLo, g.FileSizeHi, g.FileSizeMB)
+				v.SpeedBps = g.DownloadRate
+				v.Health = g.Health
 				if g.DownloadRate > 0 {
-					v.EtaSec = g.RemainingSizeMB * 1024 * 1024 / g.DownloadRate
+					v.EtaSec = remaining / g.DownloadRate
 				}
-				v.State = StatusDownloading // queued/paused/pp are all "not done yet"
+				// Everything in the queue is "not done yet", but keep the native
+				// status so a console can show paused / repairing / unpacking.
+				v.State = StatusDownloading
+				if g.Status == "QUEUED" || g.Status == "PAUSED" {
+					v.State = StatusQueued
+				}
 				return v, nil
 			}
 		}
@@ -159,10 +185,14 @@ func (n *NZBGet) Describe(ctx context.Context, id string) (JobView, error) {
 				if h.NZBID != want {
 					continue
 				}
-				v := JobView{Title: h.Name, BytesTotal: h.FileSizeMB * 1024 * 1024, EtaSec: -1}
+				v := NewJobView()
+				v.Title = h.Name
+				v.NativeState = h.Status
+				v.BytesTotal = h.FileSizeMB * 1024 * 1024
 				switch {
 				case strings.HasPrefix(h.Status, "SUCCESS"):
 					v.State = StatusCompleted
+					v.BytesDone = v.BytesTotal
 					if h.DestDir != "" {
 						v.Files = []string{h.DestDir}
 					}
@@ -179,7 +209,104 @@ func (n *NZBGet) Describe(ctx context.Context, id string) (JobView, error) {
 	}
 
 	// Accepted but not yet visible in either list.
-	return JobView{State: StatusQueued, EtaSec: -1}, nil
+	v := NewJobView()
+	v.State = StatusQueued
+	v.NativeState = "pending"
+	return v, nil
+}
+
+// Pause pauses one queue group.
+func (n *NZBGet) Pause(ctx context.Context, id string) error {
+	return n.edit(ctx, id, "GroupPause")
+}
+
+// Resume resumes one queue group.
+func (n *NZBGet) Resume(ctx context.Context, id string) error {
+	return n.edit(ctx, id, "GroupResume")
+}
+
+func (n *NZBGet) edit(ctx context.Context, id, command string) error {
+	want, err := strconv.Atoi(id)
+	if err != nil {
+		return fmt.Errorf("nzbget %s: bad id %q", command, id)
+	}
+	_, err = n.call(ctx, "editqueue", command, 0, "", []int{want})
+	return err
+}
+
+// ClientStatus reports NZBGet's global download state, including whether any
+// usenet server is actually connected — the usual cause of a stuck queue.
+func (n *NZBGet) ClientStatus(ctx context.Context) ClientStatus {
+	cs := ClientStatus{Name: n.Name()}
+	res, err := n.call(ctx, "status")
+	if err != nil {
+		cs.Error = err.Error()
+		return cs
+	}
+	var st struct {
+		DownloadRate    int64 `json:"DownloadRate"`
+		ServerPaused    bool  `json:"ServerPaused"`
+		Download2Paused bool  `json:"Download2Paused"`
+		FreeDiskSpaceLo int64 `json:"FreeDiskSpaceLo"`
+		FreeDiskSpaceHi int64 `json:"FreeDiskSpaceHi"`
+		FreeDiskSpaceMB int64 `json:"FreeDiskSpaceMB"`
+		RemainingSizeMB int64 `json:"RemainingSizeMB"`
+		PostJobCount    int32 `json:"PostJobCount"`
+		ArticleCacheMB  int64 `json:"ArticleCacheMB"`
+		QuotaReached    bool  `json:"QuotaReached"`
+		NewsServers     []struct {
+			ID     int  `json:"ID"`
+			Active bool `json:"Active"`
+		} `json:"NewsServers"`
+	}
+	if err := json.Unmarshal(res, &st); err != nil {
+		cs.Error = err.Error()
+		return cs
+	}
+	free := exact64(st.FreeDiskSpaceLo, st.FreeDiskSpaceHi, st.FreeDiskSpaceMB)
+	active := 0
+	for _, s := range st.NewsServers {
+		if s.Active {
+			active++
+		}
+	}
+	cs.Reachable = true
+	cs.DownBps = st.DownloadRate
+	cs.Paused = st.ServerPaused || st.Download2Paused
+	cs.FreeDisk = &free
+	cs.Detail = map[string]string{
+		"news_servers_active": strconv.Itoa(active) + "/" + strconv.Itoa(len(st.NewsServers)),
+		"post_jobs":           strconv.Itoa(int(st.PostJobCount)),
+	}
+	if st.QuotaReached {
+		cs.Detail["quota"] = "reached"
+	}
+	return cs
+}
+
+// Adopt re-discovers this gateway's jobs after a restart: everything in our
+// category that is still in the queue, plus anything already in history.
+func (n *NZBGet) Adopt(ctx context.Context) ([]AdoptedJob, error) {
+	var out []AdoptedJob
+	res, err := n.call(ctx, "listgroups", 0)
+	if err != nil {
+		return nil, err
+	}
+	var groups []struct {
+		NZBID    int    `json:"NZBID"`
+		NZBName  string `json:"NZBName"`
+		Category string `json:"Category"`
+	}
+	if err := json.Unmarshal(res, &groups); err != nil {
+		return nil, err
+	}
+	for _, g := range groups {
+		if n.Category != "" && g.Category != n.Category {
+			continue
+		}
+		out = append(out, AdoptedJob{ClientJobID: strconv.Itoa(g.NZBID), Title: g.NZBName})
+	}
+	return out, nil
 }
 
 // Remove drops the item from the active queue or history.
