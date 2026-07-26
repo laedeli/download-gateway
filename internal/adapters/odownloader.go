@@ -137,10 +137,11 @@ func (o *ODownloader) Describe(ctx context.Context, packageID string) (JobView, 
 // otherwise it is downloading (or queued if nothing has started).
 func foldODL(links []odlDownloadView) JobView {
 	if len(links) == 0 {
-		return JobView{State: StatusQueued}
+		jv := NewJobView()
+		jv.State = StatusQueued
+		return jv
 	}
-	var jv JobView
-	jv.EtaSec = -1
+	jv := NewJobView()
 	allFinished := true
 	anyRunning := false
 	anyFailed := false

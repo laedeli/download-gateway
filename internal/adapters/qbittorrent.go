@@ -165,6 +165,9 @@ type qbTorrent struct {
 	Completed   int64   `json:"completed"`
 	ContentPath string  `json:"content_path"`
 	SavePath    string  `json:"save_path"`
+	NumSeeds    int32   `json:"num_seeds"`
+	NumLeechs   int32   `json:"num_leechs"`
+	Tags        string  `json:"tags"`
 }
 
 // byTag returns the torrent carrying our tag, or ok=false when it isn't present
@@ -206,7 +209,10 @@ func (q *QBittorrent) Describe(ctx context.Context, tag string) (JobView, error)
 	}
 	if !ok {
 		// Accepted but not yet visible (metadata fetch) — report queued.
-		return JobView{State: StatusQueued, EtaSec: -1}, nil
+		v := NewJobView()
+		v.State = StatusQueued
+		v.NativeState = "pending"
+		return v, nil
 	}
 	return foldQB(t), nil
 }
@@ -241,13 +247,15 @@ func (q *QBittorrent) Remove(ctx context.Context, tag string) error {
 // state (or progress==1) means the download completed — that is the signal
 // acquire waits on to stage + package.
 func foldQB(t qbTorrent) JobView {
-	v := JobView{
-		Title:      t.Name,
-		BytesDone:  t.Completed,
-		BytesTotal: t.Size,
-		SpeedBps:   t.DlSpeed,
-		EtaSec:     t.Eta,
-	}
+	v := NewJobView()
+	v.Title = t.Name
+	v.NativeState = t.State
+	v.BytesDone = t.Completed
+	v.BytesTotal = t.Size
+	v.SpeedBps = t.DlSpeed
+	v.EtaSec = t.Eta
+	v.Seeders = t.NumSeeds
+	v.Leechers = t.NumLeechs
 	// qB reports eta 8640000 (100 days) for "unknown/infinite".
 	if t.Eta >= 8640000 || t.Eta < 0 {
 		v.EtaSec = -1
@@ -270,6 +278,107 @@ func foldQB(t qbTorrent) JobView {
 	return v
 }
 
+// Pause stops a torrent. qBittorrent renamed pause/resume to stop/start in 5.x,
+// so try the modern verb first and fall back to the legacy one.
+func (q *QBittorrent) Pause(ctx context.Context, tag string) error {
+	return q.control(ctx, tag, "stop", "pause")
+}
+
+// Resume restarts a paused torrent (see Pause for the 5.x rename).
+func (q *QBittorrent) Resume(ctx context.Context, tag string) error {
+	return q.control(ctx, tag, "start", "resume")
+}
+
+func (q *QBittorrent) control(ctx context.Context, tag string, verbs ...string) error {
+	t, ok, err := q.byTag(ctx, tag)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("qbittorrent: no torrent for job %s", tag)
+	}
+	var lastErr error
+	for _, verb := range verbs {
+		resp, err := q.authed(ctx, func() (*http.Response, error) {
+			return q.post(ctx, "/api/v2/torrents/"+verb, url.Values{"hashes": {t.Hash}})
+		})
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		resp.Body.Close()
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return nil
+		}
+		lastErr = fmt.Errorf("qbittorrent %s: %d %q", verb, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return lastErr
+}
+
+// ClientStatus reports qBittorrent's global transfer state.
+func (q *QBittorrent) ClientStatus(ctx context.Context) ClientStatus {
+	cs := ClientStatus{Name: q.Name()}
+	resp, err := q.authed(ctx, func() (*http.Response, error) {
+		return q.get(ctx, "/api/v2/transfer/info", nil)
+	})
+	if err != nil {
+		cs.Error = err.Error()
+		return cs
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		cs.Error = fmt.Sprintf("transfer/info: %d", resp.StatusCode)
+		return cs
+	}
+	var info struct {
+		DlSpeed          int64  `json:"dl_info_speed"`
+		UpSpeed          int64  `json:"up_info_speed"`
+		ConnectionStatus string `json:"connection_status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		cs.Error = err.Error()
+		return cs
+	}
+	cs.Reachable = true
+	cs.DownBps = info.DlSpeed
+	cs.UpBps = info.UpSpeed
+	if info.ConnectionStatus != "" {
+		cs.Detail = map[string]string{"connection": info.ConnectionStatus}
+	}
+	return cs
+}
+
+// Adopt re-discovers gateway-owned torrents after a restart. Every job we add
+// carries a "dlg-" tag, which is also its clientJobID — so the tag list is the
+// job list.
+func (q *QBittorrent) Adopt(ctx context.Context) ([]AdoptedJob, error) {
+	resp, err := q.authed(ctx, func() (*http.Response, error) {
+		return q.get(ctx, "/api/v2/torrents/info", nil)
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("qbittorrent info: %d", resp.StatusCode)
+	}
+	var list []qbTorrent
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, err
+	}
+	var out []AdoptedJob
+	for _, t := range list {
+		for _, tag := range strings.Split(t.Tags, ",") {
+			if tag = strings.TrimSpace(tag); strings.HasPrefix(tag, jobTagPrefix) {
+				out = append(out, AdoptedJob{ClientJobID: tag, Title: t.Name})
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
 // contentFiles reports the completed content path (a file, or the torrent's
 // folder) so acquire can stage the video. content_path is absolute; fall back
 // to save_path when qB hasn't populated it.
@@ -283,12 +392,16 @@ func contentFiles(t qbTorrent) []string {
 	return nil
 }
 
+// jobTagPrefix marks the torrents this gateway owns. It is also how Adopt
+// re-discovers them after a restart.
+const jobTagPrefix = "dlg-"
+
 // newJobTag returns a collision-resistant tag used as the clientJobID.
 func newJobTag() string {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		// rand.Read failing is effectively impossible; fall back to time.
-		return "dlg-" + fmt.Sprintf("%x", time.Now().UnixNano())
+		return jobTagPrefix + fmt.Sprintf("%x", time.Now().UnixNano())
 	}
-	return "dlg-" + hex.EncodeToString(b[:])
+	return jobTagPrefix + hex.EncodeToString(b[:])
 }
