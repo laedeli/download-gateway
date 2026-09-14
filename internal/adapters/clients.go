@@ -50,15 +50,26 @@ type TypeInfo struct {
 
 // catalog is the set of adapter types a client can be created from. The
 // JDownloader stub is deliberately absent: it is not wired to anything real.
+//
+// Every build applies the pushed-client endpoint policy (see guard); the
+// environment clients main wires with the constructors directly do not get it.
 var catalog = []TypeInfo{
 	{
 		Type: "nzbget", Protocols: []string{ProtocolUsenet}, Auth: []string{AuthBasic, AuthNone},
 		AcceptsPayload: true, CanPause: true,
-		build: func(s ClientSpec) Adapter { return NewNZBGet(s.BaseURL, s.Username, s.Secret, s.Category) },
+		build: func(s ClientSpec) Adapter {
+			n := NewNZBGet(s.BaseURL, s.Username, s.Secret, s.Category)
+			guard(n.HTTP)
+			return n
+		},
 	},
 	{
 		Type: "odownloader", Protocols: []string{ProtocolHTTP}, Auth: []string{AuthToken, AuthNone},
-		build: func(s ClientSpec) Adapter { return NewODownloader(s.BaseURL, s.Secret) },
+		build: func(s ClientSpec) Adapter {
+			o := NewODownloader(s.BaseURL, s.Secret)
+			guard(o.HTTP)
+			return o
+		},
 	},
 	{
 		Type: "qbittorrent", Protocols: []string{ProtocolTorrent}, Auth: []string{AuthBasic, AuthNone},
@@ -66,6 +77,7 @@ var catalog = []TypeInfo{
 		build: func(s ClientSpec) Adapter {
 			q := NewQBittorrent(s.BaseURL, s.Username, s.Secret)
 			q.Category = s.Category
+			guard(q.HTTP)
 			return q
 		},
 	},

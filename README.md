@@ -124,6 +124,12 @@ the caller maps a finished download back to its request.
   under that id stays as it was.
 - `secret` is write-only. `GET /api/v1/config/clients` reports `secretSet`
   instead, and secrets never appear in logs.
+- Pushed clients, and the clients built by the test endpoint, never connect to
+  a link-local or cloud metadata address (`169.254.0.0/16`, `fe80::/10`,
+  `100.100.100.200`, `fd00:ec2::254`). The check runs on the resolved address
+  at connect time, so a name that later resolves there is refused too. They
+  follow a redirect only within their own scheme and host, and they ignore
+  proxy environment variables. Environment clients are built as before.
 
 `POST /api/v1/config/clients/test` takes one client object (the id is optional)
 and answers `200 {"reachable", "version", "error", "status"}`; a spec that does

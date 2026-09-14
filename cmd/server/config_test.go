@@ -200,6 +200,7 @@ func TestConfigTestEndpoint(t *testing.T) {
 	// Unreachable endpoint, invalid spec, bad id: all answered 200 with the reason.
 	for name, body := range map[string]map[string]any{
 		"unreachable": {"type": "nzbget", "baseUrl": "http://127.0.0.1:1", "auth": "none"},
+		"metadata":    {"type": "qbittorrent", "baseUrl": "http://169.254.169.254", "auth": "none"},
 		"invalid":     {"type": "nzbget", "baseUrl": "not a url", "auth": "none"},
 		"bad id":      {"id": "Not_Valid", "type": "nzbget", "baseUrl": nzb.URL, "auth": "none"},
 	} {
