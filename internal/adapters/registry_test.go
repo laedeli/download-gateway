@@ -198,8 +198,27 @@ func TestRegistryInvalidEditKeepsRunningClient(t *testing.T) {
 	if r.Get("usenet") != ad || len(res.Removed) != 0 {
 		t.Fatal("the running client was replaced or removed by an invalid edit")
 	}
-	if r.Revision() != 2 {
-		t.Errorf("revision = %d, want the push's", r.Revision())
+	// The push did not fully take effect, so its revision is not reported.
+	if r.Revision() != 1 || res.Revision != 1 {
+		t.Errorf("revision = %d (result %d), want the previous one", r.Revision(), res.Revision)
+	}
+	if res := r.Apply(3, []ClientSpec{nzbSpec("usenet", "y")}, notInUse); res.Revision != 3 || r.Revision() != 3 {
+		t.Errorf("a clean push after the failed one: revision = %d (result %d), want 3", r.Revision(), res.Revision)
+	}
+}
+
+// Entries that do validate take effect even when others in the same push fail;
+// only the revision waits for a clean push.
+func TestRegistryPartialPushAppliesValidEntries(t *testing.T) {
+	r := NewRegistry()
+	bad := qbSpec("torrents", "x")
+	bad.Type = "nope"
+	res := r.Apply(5, []ClientSpec{nzbSpec("usenet", "x"), bad}, notInUse)
+	if !slices.Equal(res.Applied, []string{"usenet"}) || len(res.Errors) != 1 || r.Get("usenet") == nil {
+		t.Fatalf("result = %+v", res)
+	}
+	if res.Revision != 0 || r.Revision() != 0 {
+		t.Errorf("revision = %d (result %d), want 0 until a push applies cleanly", r.Revision(), res.Revision)
 	}
 }
 

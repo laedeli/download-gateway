@@ -106,7 +106,8 @@ func TestConfigPushAndList(t *testing.T) {
 		t.Fatalf("push response echoes the secret: %s", rec.Body)
 	}
 	applied := decode[configApplyResponse](t, rec)
-	if applied.Revision != 7 || len(applied.Applied) != 1 || applied.Applied[0] != "usenet" {
+	// Two entries failed, so revision 7 is not in effect: the previous one (none) is reported.
+	if applied.Revision != 0 || len(applied.Applied) != 1 || applied.Applied[0] != "usenet" {
 		t.Errorf("applied = %+v", applied)
 	}
 	errs := map[string]string{}
@@ -125,8 +126,8 @@ func TestConfigPushAndList(t *testing.T) {
 		t.Fatalf("client list has a secret field: %s", rec.Body)
 	}
 	list := decode[configClientsResponse](t, rec)
-	if list.Revision != 7 || len(list.Clients) != 2 {
-		t.Fatalf("list = %+v", list)
+	if list.Revision != 0 || len(list.Clients) != 2 {
+		t.Fatalf("list = %+v, want the valid client running and the revision not yet in effect", list)
 	}
 	odl, usenet := list.Clients[0], list.Clients[1]
 	if odl.ID != "odownloader" || odl.Source != "env" || odl.BaseURL != "http://odl.example" || !odl.SecretSet {
@@ -140,6 +141,21 @@ func TestConfigPushAndList(t *testing.T) {
 	ids := decode[[]string](t, tg.call(t, http.MethodGet, "/api/v1/clients", nil, token))
 	if strings.Join(ids, ",") != "odownloader,usenet" {
 		t.Errorf("GET /api/v1/clients = %v, want an array of ids", ids)
+	}
+
+	// The same revision pushed again without the failing entries takes effect.
+	rec = tg.call(t, http.MethodPut, "/api/v1/config/clients", map[string]any{
+		"revision": 7,
+		"clients": []map[string]any{
+			{"id": "usenet", "type": "nzbget", "baseUrl": nzb.URL, "auth": "basic",
+				"username": "nzbget", "secret": pushedSecret, "category": "acquire", "protocols": []string{"usenet"}},
+		},
+	}, token)
+	if applied := decode[configApplyResponse](t, rec); applied.Revision != 7 || len(applied.Errors) != 0 {
+		t.Errorf("clean push = %+v", applied)
+	}
+	if list := decode[configClientsResponse](t, tg.call(t, http.MethodGet, "/api/v1/config/clients", nil, token)); list.Revision != 7 {
+		t.Errorf("revision after the clean push = %d, want 7", list.Revision)
 	}
 
 	// An empty set removes every API client and nothing else.

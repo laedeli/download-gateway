@@ -53,7 +53,9 @@ type configApplyResponse struct {
 
 // handleConfigApply atomically replaces every API client with the pushed set.
 // Added and replaced clients are adopted in the background, so jobs already
-// running in them are tracked without holding up the response.
+// running in them are tracked without holding up the response. The response
+// revision is the one in effect, which stays the previous one when an entry
+// failed (see Registry.Apply).
 func (g *gateway) handleConfigApply(w http.ResponseWriter, r *http.Request) {
 	var req configPush
 	if !decodeJSON(w, r, maxConfigBody, &req) {
@@ -82,9 +84,9 @@ func (g *gateway) handleConfigApply(w http.ResponseWriter, r *http.Request) {
 	for _, e := range res.Errors {
 		failed = append(failed, e.ID)
 	}
-	// Ids and the revision only: messages could echo configuration.
-	slog.Info("client configuration applied", "revision", res.Revision, "applied", res.Applied,
-		"started", started, "draining", res.Draining, "removed", res.Removed, "failed", failed)
+	// Ids and revisions only: messages could echo configuration.
+	slog.Info("client configuration applied", "pushed_revision", *req.Revision, "revision", res.Revision,
+		"applied", res.Applied, "started", started, "draining", res.Draining, "removed", res.Removed, "failed", failed)
 
 	writeJSON(w, http.StatusOK, configApplyResponse{Revision: res.Revision, Applied: res.Applied, Errors: res.Errors})
 }

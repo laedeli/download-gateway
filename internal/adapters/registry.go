@@ -190,7 +190,8 @@ func (r *Registry) Config() (int64, []ClientInfo) {
 	return r.revision, out
 }
 
-// Revision is the revision of the last applied push; 0 when nothing was pushed.
+// Revision is the revision of the last push that applied without errors; 0 when
+// no push has.
 func (r *Registry) Revision() int64 {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -205,6 +206,8 @@ type ApplyError struct {
 
 // ApplyResult reports what a push changed.
 type ApplyResult struct {
+	// Revision is the revision in effect after the push: the pushed one when
+	// every entry applied, otherwise the one before it.
 	Revision int64
 	// Applied lists every pushed client now in effect: added, replaced, or
 	// unchanged.
@@ -228,12 +231,17 @@ type ApplyResult struct {
 // Errors are per client. An invalid entry is not applied; if a client with
 // that id is already running it is kept as it was, so a bad edit cannot take
 // down a working client. An id owned by an env client is an error too.
-// The revision is recorded regardless, since the push as a whole was applied.
+//
+// The valid entries take effect either way, but the pushed revision is only
+// recorded when there were no errors. Otherwise the gateway keeps reporting the
+// previous revision, so the owner can tell from a later GET alone — after its
+// own restart, or when the push response was lost — that the configuration it
+// holds is not fully in effect, and push again.
 //
 // inUse is called with the registry lock held; it must not call back into the
 // registry.
 func (r *Registry) Apply(revision int64, specs []ClientSpec, inUse func(id string) bool) ApplyResult {
-	res := ApplyResult{Revision: revision, Applied: []string{}, Errors: []ApplyError{}}
+	res := ApplyResult{Applied: []string{}, Errors: []ApplyError{}}
 
 	counts := map[string]int{}
 	for _, s := range specs {
@@ -305,7 +313,10 @@ func (r *Registry) Apply(revision int64, specs []ClientSpec, inUse func(id strin
 		res.Removed = append(res.Removed, id)
 	}
 
-	r.revision = revision
+	if len(res.Errors) == 0 {
+		r.revision = revision
+	}
+	res.Revision = r.revision
 	sort.Strings(res.Draining)
 	sort.Strings(res.Removed)
 	return res

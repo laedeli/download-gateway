@@ -122,6 +122,10 @@ the caller maps a finished download back to its request.
 - Errors are per client: an invalid entry, a duplicate id, or an id owned by an
   environment client is reported and not applied. A client already running
   under that id stays as it was.
+- `revision` (in the response and in `GET`) is the last revision that applied
+  without errors. The valid entries of a push with errors still take effect,
+  but the previous revision stays in place, so the owner can tell from `GET`
+  alone that its configuration is not fully in effect and push again.
 - `secret` is write-only. `GET /api/v1/config/clients` reports `secretSet`
   instead, and secrets never appear in logs.
 - Pushed clients, and the clients built by the test endpoint, never connect to
