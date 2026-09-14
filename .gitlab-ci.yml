@@ -1,23 +1,11 @@
-# Stube standard CI/CD pipeline for download-gateway.
+# CI pipeline for download-gateway: test, then build and push the image.
 # Disabled by default — set CI_ENABLED=true as a CI/CD variable to activate.
-# See https://kb.nalet.cloud/stube/adr/019-download-plane-consolidation
 #
-# Required CI/CD variables (group-level ones are shared with chino-api):
-#   CI_REGISTRY*, OC_SERVER, OC_TOKEN, REGISTRY_PULL_*  — group-level (exist)
-#   ODOWNLOADER_TOKEN                                   — masked; the oDownloader
-#       daemon's static bearer token (== secret odownloader-api key "token").
-#       The deploy job mints `odownloader-api` in stube from it; both the
-#       gateway and the migrated oDownloader daemon consume it.
-#   WIREGUARD_CONF                                      — masked/file; the full
-#       wg0.conf (incl. the cluster-CIDR PostUp split-tunnel rules — see
-#       k8s/clients/secrets.example.yaml). The deploy job mints the
-#       `wireguard-config` secret the oDownloader + qBittorrent VPN sidecars
-#       mount. NZBGet egresses directly and does not use it.
+# Deploying is not done here. The gateway is deployed by whatever installs the
+# application that uses it, and the download clients it talks to are external
+# endpoints that nothing in this repository deploys.
 #
-# The deploy job also provisions the migrated download clients (oDownloader,
-# qBittorrent, NZBGet) into stube — the download plane is one deployable unit
-# (ADR-019). The oDownloader daemon image itself is built by the
-# infrastructure/oDownloader pipeline; here we only (re)deploy it.
+# Required CI/CD variables: CI_REGISTRY* (provided by GitLab).
 workflow:
   rules:
     - if: $CI_ENABLED == "true"
@@ -27,11 +15,9 @@ workflow:
 stages:
   - test
   - containerize
-  - deploy
 
 variables:
   IMAGE_NAME: $CI_REGISTRY_IMAGE
-  OC_NAMESPACE: stube
 
 test:
   stage: test
@@ -40,6 +26,7 @@ test:
     - apk add --no-cache git
     - go vet ./...
     - go build ./...
+    - go test ./...
   rules:
     - if: '$CI_PIPELINE_SOURCE == "push"'
 
@@ -62,103 +49,5 @@ containerize:
       --destination "$IMAGE_NAME:$CI_COMMIT_SHORT_SHA"
       --destination "$IMAGE_NAME:latest"
       --push-retry=5
-  rules:
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
-
-deploy:
-  stage: deploy
-  image: registry.nalet.cloud/infrastructure/library/openshift/origin-cli:4.18
-  needs: ["containerize"]
-  script:
-    - oc login "$OC_SERVER" --token="$OC_TOKEN" --insecure-skip-tls-verify=true
-    - |
-      oc -n "$OC_NAMESPACE" create secret docker-registry gitlab-registry \
-        --docker-server="$CI_REGISTRY" \
-        --docker-username="${REGISTRY_PULL_USER:-$CI_REGISTRY_USER}" \
-        --docker-password="${REGISTRY_PULL_PASSWORD:-$CI_REGISTRY_PASSWORD}" \
-        --dry-run=client -o yaml | oc -n "$OC_NAMESPACE" apply -f -
-    # Kafka mTLS client cert. Strimzi materialises the stube-download-gateway
-    # KafkaUser as a secret in platform-event-streaming; copy it into stube so
-    # the gateway pod can mount it (keys: user.crt / user.key / ca.crt).
-    # Recreate from the three data keys rather than piping the whole object —
-    # the source secret carries Strimzi ownerReferences (blockOwnerDeletion ->
-    # the KafkaUser) that a cross-namespace apply rejects as Forbidden.
-    # ca.crt must be the CLUSTER CA (verifies the broker's server cert), NOT
-    # the KafkaUser secret's own ca.crt (that's the clients-CA and yields
-    # "x509: certificate signed by unknown authority"). user.crt/user.key are
-    # the client identity from the KafkaUser secret.
-    - |
-      SRC=stube-download-gateway
-      CA=platform-kafka-cluster-ca-cert
-      if oc -n platform-event-streaming get secret "$SRC" >/dev/null 2>&1; then
-        oc -n "$OC_NAMESPACE" create secret generic "$SRC" \
-          --from-literal=ca.crt="$(oc -n platform-event-streaming get secret $CA -o jsonpath='{.data.ca\.crt}' | base64 -d)" \
-          --from-literal=user.crt="$(oc -n platform-event-streaming get secret $SRC -o jsonpath='{.data.user\.crt}' | base64 -d)" \
-          --from-literal=user.key="$(oc -n platform-event-streaming get secret $SRC -o jsonpath='{.data.user\.key}' | base64 -d)" \
-          --dry-run=client -o yaml | oc -n "$OC_NAMESPACE" apply -f -
-      else
-        echo "$SRC KafkaUser secret not readable in platform-event-streaming; gateway will run in scaffold (log-only) mode"
-      fi
-    # oDownloader daemon bearer token — consumed by the gateway adapter, the
-    # migrated daemon, and katalog-manager-api (all read the odownloader-api
-    # secret). Create-if-absent so the token is stable across redeploys; value
-    # comes from the ODOWNLOADER_TOKEN CI var, else the old namespace's secret
-    # (parallel-run), else a freshly minted random token. No CI var required.
-    - |
-      if oc -n "$OC_NAMESPACE" get secret odownloader-api >/dev/null 2>&1; then
-        echo "odownloader-api already present in $OC_NAMESPACE; keeping it"
-      else
-        TOKEN="${ODOWNLOADER_TOKEN:-}"
-        if [ -z "$TOKEN" ]; then
-          TOKEN=$(oc -n cloud-nalet-odownloader get secret odownloader-api -o jsonpath='{.data.token}' 2>/dev/null | base64 -d || true)
-          [ -n "$TOKEN" ] && echo "sourced oDownloader token from cloud-nalet-odownloader"
-        fi
-        if [ -z "$TOKEN" ]; then
-          TOKEN=$(openssl rand -hex 24)
-          echo "minted a fresh oDownloader API token"
-        fi
-        oc -n "$OC_NAMESPACE" create secret generic odownloader-api \
-          --from-literal=token="$TOKEN" \
-          --dry-run=client -o yaml | oc -n "$OC_NAMESPACE" apply -f -
-      fi
-    # WireGuard config for the oDownloader + qBittorrent VPN sidecars.
-    # WIREGUARD_CONF is a file-type CI var (the wg0.conf is multi-line, so it
-    # can't be a masked var); fall back to a literal value or a pre-existing
-    # secret. The value is never echoed.
-    - |
-      if [ -n "${WIREGUARD_CONF:-}" ] && [ -f "${WIREGUARD_CONF}" ]; then
-        oc -n "$OC_NAMESPACE" create secret generic wireguard-config \
-          --from-file=wg0.conf="${WIREGUARD_CONF}" \
-          --dry-run=client -o yaml | oc -n "$OC_NAMESPACE" apply -f -
-      elif [ -n "${WIREGUARD_CONF:-}" ]; then
-        oc -n "$OC_NAMESPACE" create secret generic wireguard-config \
-          --from-literal=wg0.conf="${WIREGUARD_CONF}" \
-          --dry-run=client -o yaml | oc -n "$OC_NAMESPACE" apply -f -
-      else
-        echo "WIREGUARD_CONF not set; expecting an existing wireguard-config secret"
-        oc -n "$OC_NAMESPACE" get secret wireguard-config >/dev/null
-      fi
-    # --- Download plane: clients (ADR-019, one deployable unit) ---
-    # SA + privileged/anyuid SCC for the WireGuard sidecars.
-    - oc -n "$OC_NAMESPACE" apply -f k8s/clients/serviceaccount.yaml
-    - oc -n "$OC_NAMESPACE" apply -f k8s/clients/scc-bindings.yaml
-    - oc -n "$OC_NAMESPACE" apply -f k8s/clients/networkpolicy.yaml
-    # The clients pull the oDownloader daemon image from the infrastructure
-    # group and the linuxserver/jlesage images via the cache mirror, so the
-    # gitlab-registry pull secret (created above) must be linked to the SA.
-    - oc -n "$OC_NAMESPACE" secrets link download-clients gitlab-registry --for=pull
-    - oc -n "$OC_NAMESPACE" apply -f k8s/clients/odownloader.yaml
-    - oc -n "$OC_NAMESPACE" apply -f k8s/clients/qbittorrent.yaml
-    - oc -n "$OC_NAMESPACE" apply -f k8s/clients/nzbget.yaml
-    - oc -n "$OC_NAMESPACE" rollout status deployment/odownloader --timeout=10m
-    # --- Gateway control plane ---
-    - oc -n "$OC_NAMESPACE" apply -f k8s/service.yaml
-    - oc -n "$OC_NAMESPACE" apply -f k8s/servicemonitor.yaml
-    - oc -n "$OC_NAMESPACE" apply -f k8s/deployment.yaml
-    - oc -n "$OC_NAMESPACE" set image deployment/download-gateway download-gateway="$IMAGE_NAME:$CI_COMMIT_SHORT_SHA"
-    - oc -n "$OC_NAMESPACE" rollout status deployment/download-gateway --timeout=3m
-    - oc logout
-  environment:
-    name: download-gateway-beta
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
