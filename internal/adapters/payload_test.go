@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"testing/iotest"
 )
 
 // fakeNZBGet records every JSON-RPC call and answers append with a fixed NZBID.
@@ -283,5 +284,51 @@ func TestProbes(t *testing.T) {
 	}
 	if _, err := NewODownloader(odl.URL, "bad").Probe(t.Context()); err == nil {
 		t.Error("odownloader probe accepted a rejected token")
+	}
+}
+
+func TestBase64Reader(t *testing.T) {
+	for _, n := range []int{0, 1, 2, 3, base64Chunk - 1, base64Chunk, base64Chunk + 1, 3*base64Chunk + 2} {
+		src := make([]byte, n)
+		for i := range src {
+			src[i] = byte(i * 7)
+		}
+		got, err := io.ReadAll(iotest.HalfReader(&base64Reader{src: src}))
+		if err != nil || string(got) != base64.StdEncoding.EncodeToString(src) {
+			t.Errorf("%d bytes: encoded differently (%v)", n, err)
+		}
+	}
+}
+
+// The streamed append body is exactly what marshalling the call would send,
+// with a Content-Length rather than chunked encoding.
+func TestNZBGetStreamedAppendMatchesMarshal(t *testing.T) {
+	var raw []byte
+	var length int64
+	var chunked bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ = io.ReadAll(r.Body)
+		length, chunked = r.ContentLength, len(r.TransferEncoding) > 0
+		_, _ = w.Write([]byte(`{"result":42}`))
+	}))
+	defer srv.Close()
+
+	payload := make([]byte, 3*base64Chunk+1)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	title := `A <B> & "C"`
+	if _, err := NewNZBGet(srv.URL, "", "", "").Add(t.Context(), Job{Title: title, Payload: payload, Category: "acquire"}); err != nil {
+		t.Fatal(err)
+	}
+	want, _ := json.Marshal(map[string]any{
+		"method": "append", "id": 1,
+		"params": []any{title + ".nzb", base64.StdEncoding.EncodeToString(payload), "acquire", 0, false, false, "", 0, "FORCE"},
+	})
+	if string(raw) != string(want) {
+		t.Fatalf("streamed body differs from the marshalled call:\n got %.200s\nwant %.200s", raw, want)
+	}
+	if length != int64(len(want)) || chunked {
+		t.Errorf("content length = %d (chunked %v), want %d", length, chunked, len(want))
 	}
 }

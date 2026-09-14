@@ -203,7 +203,58 @@ func TestAddValidation(t *testing.T) {
 
 	huge := []byte(`{"client":"torrents","payload_b64":"` + strings.Repeat("A", maxAddBody) + `"}`)
 	if rec := tg.call(t, http.MethodPost, "/api/v1/downloads", huge, ""); rec.Code != http.StatusRequestEntityTooLarge {
-		t.Errorf("body over 64 MiB = %d, want 413", rec.Code)
+		t.Errorf("body over the cap = %d, want 413", rec.Code)
+	}
+}
+
+// The largest release file acquire fetches must fit an add, base64 and all,
+// with generous room for the other fields.
+func TestAddBodyFitsLargestPayload(t *testing.T) {
+	envelope, _ := json.Marshal(map[string]any{
+		"client": strings.Repeat("c", 40), "title": strings.Repeat("t", 1<<10),
+		"source": strings.Repeat("s", 16<<10), "save_path": strings.Repeat("p", 1<<10),
+		"wanted_item_id": strings.Repeat("w", 64), "payload_name": strings.Repeat("n", 1<<10),
+		"category": strings.Repeat("k", 128), "payload_b64": "",
+	})
+	if size := len(envelope) + base64.StdEncoding.EncodedLen(maxPayload); size > maxAddBody {
+		t.Fatalf("an add with a %d MiB payload is %d bytes, over the %d byte cap", maxPayload>>20, size, maxAddBody)
+	}
+}
+
+// Large adds share a memory budget: past it they are turned away with 429,
+// while small adds still go through.
+func TestLargeAddsShareABudget(t *testing.T) {
+	_, srv := newFakeQB(t)
+	tg := newTestGateway(t, nil, openVerifier())
+	tg.push(t, 1, map[string]any{"id": "torrents", "type": "qbittorrent", "baseUrl": srv.URL, "auth": "none"})
+	large := map[string]any{"client": "torrents", "payload_b64": base64.StdEncoding.EncodeToString(make([]byte, smallAddBody))}
+
+	// One add of the largest size plus one just short of it leave less room
+	// than the large add below needs.
+	first, ok := tg.admitAdd(maxAddBody)
+	second, ok2 := tg.admitAdd(addBodyBudget - maxAddBody - smallAddBody)
+	if !ok || !ok2 {
+		t.Fatal("the budget refused reservations inside it")
+	}
+	rec := tg.call(t, http.MethodPost, "/api/v1/downloads", large, "")
+	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("large add past the budget = %d %s, want 429 with Retry-After", rec.Code, rec.Body)
+	}
+	if rec := tg.call(t, http.MethodPost, "/api/v1/downloads", map[string]any{"client": "torrents", "source": "magnet:?x"}, ""); rec.Code != http.StatusAccepted {
+		t.Fatalf("small add while the budget is taken = %d %s", rec.Code, rec.Body)
+	}
+	if _, ok := tg.admitAdd(-1); ok {
+		t.Error("a body of unknown length was admitted past the budget")
+	}
+
+	first()
+	first() // idempotent
+	second()
+	if rec := tg.call(t, http.MethodPost, "/api/v1/downloads", large, ""); rec.Code != http.StatusAccepted {
+		t.Fatalf("large add after the budget freed = %d %s", rec.Code, rec.Body)
+	}
+	if tg.bodyInFlight != 0 {
+		t.Errorf("budget in use after every add finished = %d", tg.bodyInFlight)
 	}
 }
 

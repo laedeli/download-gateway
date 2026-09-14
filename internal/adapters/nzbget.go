@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -50,11 +51,24 @@ func (n *NZBGet) Name() string { return "nzbget" }
 
 // call issues one JSON-RPC request and returns the raw `result` value.
 func (n *NZBGet) call(ctx context.Context, method string, params ...any) (json.RawMessage, error) {
-	body, _ := json.Marshal(map[string]any{"method": method, "params": params, "id": 1})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.BaseURL+"/jsonrpc", bytes.NewReader(body))
+	body, err := json.Marshal(map[string]any{"method": method, "params": params, "id": 1})
 	if err != nil {
 		return nil, err
 	}
+	return n.send(ctx, method, int64(len(body)), func() io.Reader { return bytes.NewReader(body) })
+}
+
+// send posts a JSON-RPC request body of exactly length bytes; body returns a
+// fresh reader each time it is called.
+func (n *NZBGet) send(ctx context.Context, method string, length int64, body func() io.Reader) (json.RawMessage, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.BaseURL+"/jsonrpc", body())
+	if err != nil {
+		return nil, err
+	}
+	// Set explicitly so a streamed body is sent with a Content-Length, not
+	// chunked, and can be re-sent on a same-origin redirect.
+	req.ContentLength = length
+	req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(body()), nil }
 	req.Header.Set("Content-Type", "application/json")
 	if n.Username != "" {
 		req.SetBasicAuth(n.Username, n.Password)
@@ -94,12 +108,6 @@ func (n *NZBGet) Add(ctx context.Context, j Job) (string, error) {
 	if name == "" {
 		name = "download"
 	}
-	filename, content := name+".nzb", j.Source
-	if len(j.Payload) > 0 {
-		// NZBGet requires the filename's extension to match the content.
-		filename = payloadFileName(j.PayloadName, name, ".nzb")
-		content = base64.StdEncoding.EncodeToString(j.Payload)
-	}
 	category := j.Category
 	if category == "" {
 		category = n.Category
@@ -107,8 +115,15 @@ func (n *NZBGet) Add(ctx context.Context, j Job) (string, error) {
 	// append(NZBFilename, NZBContent(URL|base64), Category, Priority, AddToTop,
 	//        AddPaused, DupeKey, DupeScore, DupeMode). DupeMode must be a valid
 	// enum — FORCE always adds (a request should never be silently deduped away).
-	res, err := n.call(ctx, "append",
-		filename, content, category, 0, false, false, "", 0, "FORCE")
+	rest := []any{category, 0, false, false, "", 0, "FORCE"}
+	var res json.RawMessage
+	var err error
+	if len(j.Payload) > 0 {
+		// NZBGet requires the filename's extension to match the content.
+		res, err = n.appendContent(ctx, payloadFileName(j.PayloadName, name, ".nzb"), j.Payload, rest)
+	} else {
+		res, err = n.call(ctx, "append", append([]any{name + ".nzb", j.Source}, rest...)...)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -121,6 +136,52 @@ func (n *NZBGet) Add(ctx context.Context, j Job) (string, error) {
 	}
 	slog.Debug("nzbget append", "nzbid", nzbID, "name", name)
 	return strconv.Itoa(nzbID), nil
+}
+
+// appendContent calls append with the NZB content. The body is byte for byte
+// what call would marshal, but the base64 content is encoded from the payload
+// while the body is sent, so a large NZB is not held again as a base64 string
+// and once more as the marshalled request. Base64 needs no JSON escaping.
+func (n *NZBGet) appendContent(ctx context.Context, filename string, content []byte, rest []any) (json.RawMessage, error) {
+	name, err := json.Marshal(filename)
+	if err != nil {
+		return nil, err
+	}
+	tail, err := json.Marshal(rest)
+	if err != nil {
+		return nil, err
+	}
+	// Keys in the order json.Marshal gives a map: id, method, params.
+	head := `{"id":1,"method":"append","params":[` + string(name) + `,"`
+	end := `",` + string(tail[1:]) + `}` // tail without its opening bracket
+	length := int64(len(head) + base64.StdEncoding.EncodedLen(len(content)) + len(end))
+	return n.send(ctx, "append", length, func() io.Reader {
+		return io.MultiReader(strings.NewReader(head), &base64Reader{src: content}, strings.NewReader(end))
+	})
+}
+
+// base64Reader reads src as standard base64, encoding one chunk at a time.
+type base64Reader struct {
+	src []byte
+	out []byte // encoded, not yet read
+	buf []byte
+}
+
+// base64Chunk is a multiple of 3, so only the last chunk carries padding.
+const base64Chunk = 48 << 10
+
+func (r *base64Reader) Read(p []byte) (int, error) {
+	if len(r.out) == 0 {
+		if len(r.src) == 0 {
+			return 0, io.EOF
+		}
+		n := min(len(r.src), base64Chunk)
+		r.buf = base64.StdEncoding.AppendEncode(r.buf[:0], r.src[:n])
+		r.out, r.src = r.buf, r.src[n:]
+	}
+	n := copy(p, r.out)
+	r.out = r.out[n:]
+	return n, nil
 }
 
 type nzbGroup struct {

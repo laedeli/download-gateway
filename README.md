@@ -84,8 +84,13 @@ Clients come from two places:
   client never sees the link — or any key embedded in it. A client type that
   cannot take a payload answers `400`.
 - `save_path` and `category` default to the client's `savePath` and `category`.
-- The body is capped at 64 MiB. An unknown client is `404`, a client that a push
-  removed while it still has jobs is `409`, a client error is `502`.
+- The body is capped at about 70 MiB: the base64 form of a 50 MiB payload plus
+  4 MiB for the other fields. 50 MiB matches the largest NZB acquire fetches;
+  raise both together. Adds with bodies over 1 MiB share an in-flight budget
+  of twice the cap, because each holds its payload in memory until the client
+  has it; past the budget an add is answered `429` with `Retry-After`.
+- An unknown client is `404`, a client that a push removed while it still has
+  jobs is `409`, a client error is `502`.
 
 `wanted_item_id` is stamped onto the job and echoed on the `completed` event so
 the caller maps a finished download back to its request.

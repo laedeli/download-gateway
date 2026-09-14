@@ -51,9 +51,23 @@ const lostAfter = 10 * time.Minute
 // so one slow client stalled every other job's updates.
 const pollConcurrency = 8
 
+// maxPayload is the largest NZB or .torrent content an add is sized for: the
+// largest release file acquire fetches itself (an NZB, 50 MiB).
+const maxPayload = 50 << 20
+
 // maxAddBody caps POST /api/v1/downloads. A payload travels base64-encoded
-// inside the JSON body.
-const maxAddBody = 64 << 20
+// inside the JSON body, a third larger than the content; 4 MiB is ample room for
+// the other fields. Raising acquire's NZB cap means raising maxPayload with it.
+const maxAddBody = (maxPayload+2)/3*4 + 4<<20
+
+// Large adds hold their payload in memory while it is handed to the client, so
+// the declared bodies of the adds in flight share a budget: two adds of the
+// largest size fit, or many ordinary NZBs. A body of at most smallAddBody bytes
+// cannot carry a payload worth bounding and is always admitted.
+const (
+	addBodyBudget = 2 * maxAddBody
+	smallAddBody  = 1 << 20
+)
 
 // publisher is the event sink the gateway emits to (*events.Publisher in
 // production).
@@ -81,6 +95,9 @@ type gateway struct {
 
 	stopping atomic.Bool    // set on shutdown so /readyz stops routing traffic here
 	bg       sync.WaitGroup // adoption started by config pushes
+
+	bodyMu       sync.Mutex
+	bodyInFlight int64 // declared bytes of the large adds in flight, see admitAdd
 }
 
 func newGateway(ctx context.Context, reg *adapters.Registry, pub publisher, poll time.Duration) *gateway {
@@ -210,14 +227,23 @@ type addRequest struct {
 	Title        string `json:"title"`
 	SavePath     string `json:"save_path"`
 	WantedItemID string `json:"wanted_item_id"`
-	// PayloadB64 is the NZB or .torrent content, base64-encoded. It is handed
-	// to the client instead of source.
-	PayloadB64  string `json:"payload_b64"`
+	// Payload is the NZB or .torrent content, base64-encoded on the wire as
+	// payload_b64 (encoding/json decodes it straight into bytes, without an
+	// intermediate string). It is handed to the client instead of source.
+	Payload     []byte `json:"payload_b64"`
 	PayloadName string `json:"payload_name"`
 	Category    string `json:"category"`
 }
 
 func (g *gateway) handleAdd(w http.ResponseWriter, r *http.Request) {
+	admitted, ok := g.admitAdd(r.ContentLength)
+	if !ok {
+		w.Header().Set("Retry-After", "5")
+		writeError(w, http.StatusTooManyRequests, "too many large adds in progress; retry shortly")
+		return
+	}
+	defer admitted()
+
 	var req addRequest
 	if !decodeJSON(w, r, maxAddBody, &req) {
 		return
@@ -230,17 +256,9 @@ func (g *gateway) handleAdd(w http.ResponseWriter, r *http.Request) {
 	case req.Client != "" && req.Adapter != "" && req.Client != req.Adapter:
 		writeError(w, http.StatusBadRequest, "client and adapter name different clients")
 		return
-	case id == "" || (req.Source == "" && req.PayloadB64 == ""):
+	case id == "" || (req.Source == "" && len(req.Payload) == 0):
 		writeError(w, http.StatusBadRequest, "client (or adapter) and source or payload_b64 are required")
 		return
-	}
-	var payload []byte
-	if req.PayloadB64 != "" {
-		var err error
-		if payload, err = base64.StdEncoding.DecodeString(req.PayloadB64); err != nil || len(payload) == 0 {
-			writeError(w, http.StatusBadRequest, "payload_b64 is not valid base64")
-			return
-		}
 	}
 
 	// The lease keeps a config push from dropping the client between the add
@@ -259,7 +277,7 @@ func (g *gateway) handleAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
-	if ti, ok := adapters.LookupType(c.Type); ok && len(payload) > 0 && !ti.AcceptsPayload {
+	if ti, ok := adapters.LookupType(c.Type); ok && len(req.Payload) > 0 && !ti.AcceptsPayload {
 		writeError(w, http.StatusBadRequest, c.Type+" does not accept a payload; send a source link")
 		return
 	}
@@ -272,7 +290,7 @@ func (g *gateway) handleAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	clientJobID, err := c.Adapter.Add(r.Context(), adapters.Job{
 		ID: req.WantedItemID, Source: req.Source, SavePath: savePath, Title: req.Title,
-		Category: category, Payload: payload, PayloadName: req.PayloadName,
+		Category: category, Payload: req.Payload, PayloadName: req.PayloadName,
 	})
 	if errors.Is(err, adapters.ErrPayloadUnsupported) {
 		writeError(w, http.StatusBadRequest, c.Type+" does not accept a payload; send a source link")
@@ -714,6 +732,33 @@ func optCount(v int32) *int32 {
 	return &v
 }
 
+// admitAdd reserves room in the large-add budget for a body of n declared bytes
+// (-1 when unknown, counted as the largest allowed). It returns false when the
+// body does not fit next to the adds already in flight; otherwise the caller
+// must call release once the add is done.
+func (g *gateway) admitAdd(n int64) (release func(), ok bool) {
+	if n >= 0 && n <= smallAddBody {
+		return func() {}, true
+	}
+	if n < 0 || n > maxAddBody {
+		n = maxAddBody // a longer body is refused by the cap anyway
+	}
+	g.bodyMu.Lock()
+	defer g.bodyMu.Unlock()
+	if g.bodyInFlight+n > addBodyBudget {
+		return nil, false
+	}
+	g.bodyInFlight += n
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			g.bodyMu.Lock()
+			g.bodyInFlight -= n
+			g.bodyMu.Unlock()
+		})
+	}, true
+}
+
 // decodeJSON reads a JSON body capped at limit bytes. When the body is
 // unusable it answers the request itself (400, or 413 past the cap) and
 // returns false.
@@ -721,11 +766,15 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, limit int64, v any) bool
 	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
 		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
+		var corrupt base64.CorruptInputError
+		switch {
+		case errors.As(err, &tooLarge):
 			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("request body exceeds %d MiB", limit>>20))
-			return false
+		case errors.As(err, &corrupt):
+			writeError(w, http.StatusBadRequest, "payload_b64 is not valid base64")
+		default:
+			writeError(w, http.StatusBadRequest, "invalid JSON body")
 		}
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return false
 	}
 	return true
