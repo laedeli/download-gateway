@@ -85,7 +85,7 @@ func main() {
 	gw.adoptExisting(ctx)
 	go gw.pollLoop(ctx)
 
-	verifier := auth.NewVerifier(os.Getenv("OIDC_ISSUER"))
+	verifier := auth.NewVerifier(os.Getenv("OIDC_ISSUER"), auth.ParseClientList(os.Getenv("ALLOWED_CLIENTS"))...)
 
 	r := chi.NewRouter()
 	// Unauthenticated ops endpoints.
