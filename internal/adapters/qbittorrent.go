@@ -130,6 +130,8 @@ func (q *QBittorrent) login(ctx context.Context) error {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return newStatusError("qbittorrent login failed", resp)
 	}
+	// Read the short "Ok." so the connection can be reused.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorDetail))
 	return nil
 }
 
