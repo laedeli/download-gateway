@@ -21,7 +21,7 @@ import (
 // clientJobID is the packageId; Describe aggregates the package's links
 // into a single JobView the gateway turns into events.
 type ODownloader struct {
-	BaseURL string // e.g. http://odownloader.cloud-nalet-odownloader.svc:80
+	BaseURL string // e.g. http://odownloader:80
 	Token   string // bearer; from secret odownloader-api key "token"
 	HTTP    *http.Client
 }
