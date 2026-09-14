@@ -2,13 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,7 +26,8 @@ import (
 // tracked is one in-flight job the poll loop watches until it reaches a
 // terminal state, at which point it is removed.
 type tracked struct {
-	adapter      string
+	adapter      string // client id
+	clientType   string // adapter type of that client when the job was tracked
 	clientJobID  string
 	title        string
 	wantedItemID string
@@ -47,13 +51,40 @@ const lostAfter = 10 * time.Minute
 // so one slow client stalled every other job's updates.
 const pollConcurrency = 8
 
+// maxAddBody caps POST /api/v1/downloads. A payload travels base64-encoded
+// inside the JSON body.
+const maxAddBody = 64 << 20
+
+// publisher is the event sink the gateway emits to (*events.Publisher in
+// production).
+type publisher interface {
+	EmitStarted(context.Context, events.Started) error
+	EmitProgress(context.Context, events.Progress) error
+	EmitCompleted(context.Context, events.Completed) error
+	EmitFailed(context.Context, events.Failed) error
+	Ready() bool
+}
+
+// gateway tracks jobs across the registered clients.
+//
+// Lock order: the registry may hold its own lock while it calls hasJobs (which
+// takes g.mu) during Apply and Reap, so never call into the registry while
+// holding g.mu.
 type gateway struct {
+	ctx  context.Context // process lifetime; adoption after a config push runs under it
 	reg  *adapters.Registry
-	pub  *events.Publisher
+	pub  publisher
 	poll time.Duration
 
 	mu   sync.Mutex
 	jobs map[string]*tracked // key: adapter + ":" + clientJobID
+
+	stopping atomic.Bool    // set on shutdown so /readyz stops routing traffic here
+	bg       sync.WaitGroup // adoption started by config pushes
+}
+
+func newGateway(ctx context.Context, reg *adapters.Registry, pub publisher, poll time.Duration) *gateway {
+	return &gateway{ctx: ctx, reg: reg, pub: pub, poll: poll, jobs: map[string]*tracked{}}
 }
 
 func main() {
@@ -71,15 +102,10 @@ func main() {
 	}
 	defer pub.Close()
 
-	gw := &gateway{
-		reg:  reg,
-		pub:  pub,
-		poll: envDur("POLL_INTERVAL", 5*time.Second),
-		jobs: map[string]*tracked{},
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	gw := newGateway(ctx, reg, pub, envDur("POLL_INTERVAL", 5*time.Second))
 	// Re-attach to downloads that were already running before this process
 	// started, then begin polling.
 	gw.adoptExisting(ctx)
@@ -87,29 +113,10 @@ func main() {
 
 	verifier := auth.NewVerifier(os.Getenv("OIDC_ISSUER"), auth.ParseClientList(os.Getenv("ALLOWED_CLIENTS"))...)
 
-	r := chi.NewRouter()
-	// Unauthenticated ops endpoints.
-	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
-	r.Handle("/metrics", promhttp.Handler())
-	// /api/* requires a valid bearer when OIDC_ISSUER is set (else pass-through).
-	r.Group(func(r chi.Router) {
-		r.Use(verifier.Middleware)
-		r.Get("/api/v1/clients", func(w http.ResponseWriter, _ *http.Request) {
-			writeJSON(w, http.StatusOK, reg.Names())
-		})
-		r.Get("/api/v1/clients/status", gw.handleClientStatus)
-		r.Post("/api/v1/downloads", gw.handleAdd)
-		r.Delete("/api/v1/downloads/{adapter}/{id}", gw.handleRemove)
-		r.Get("/api/v1/downloads", gw.handleList)
-		r.Post("/api/v1/downloads/{adapter}/{id}/pause", gw.handleControl("pause"))
-		r.Post("/api/v1/downloads/{adapter}/{id}/resume", gw.handleControl("resume"))
-	})
-
-	srv := &http.Server{Addr: addr, Handler: r, ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: addr, Handler: gw.routes(verifier), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
-		slog.Info("download-gateway listening", "addr", addr, "adapters", reg.Names())
+		slog.Info("download-gateway listening", "addr", addr, "clients", reg.Names(),
+			"config_api", verifier.Restricted())
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("listen failed", "err", err)
 			os.Exit(1)
@@ -118,9 +125,44 @@ func main() {
 
 	<-ctx.Done()
 	slog.Info("shutting down")
+	gw.stopping.Store(true)
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
+}
+
+func (g *gateway) routes(verifier *auth.Verifier) http.Handler {
+	r := chi.NewRouter()
+	// Unauthenticated ops endpoints.
+	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	r.Get("/readyz", g.handleReady)
+	r.Handle("/metrics", promhttp.Handler())
+	// /api/* requires a valid bearer when OIDC_ISSUER is set (else pass-through),
+	// issued to one of ALLOWED_CLIENTS when that is set too.
+	r.Group(func(r chi.Router) {
+		r.Use(verifier.Middleware)
+		r.Get("/api/v1/clients", func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, http.StatusOK, g.reg.Names())
+		})
+		r.Get("/api/v1/clients/status", g.handleClientStatus)
+		r.Post("/api/v1/downloads", g.handleAdd)
+		r.Delete("/api/v1/downloads/{adapter}/{id}", g.handleRemove)
+		r.Get("/api/v1/downloads", g.handleList)
+		r.Post("/api/v1/downloads/{adapter}/{id}/pause", g.handleControl("pause"))
+		r.Post("/api/v1/downloads/{adapter}/{id}/resume", g.handleControl("resume"))
+		// Whoever can push client configuration can point the gateway at any
+		// endpoint, so the config API only exists when callers are restricted to
+		// named clients. Otherwise its routes are simply not there (404).
+		if verifier.Restricted() {
+			r.Get("/api/v1/config/types", g.handleConfigTypes)
+			r.Get("/api/v1/config/clients", g.handleConfigClients)
+			r.Put("/api/v1/config/clients", g.handleConfigApply)
+			r.Post("/api/v1/config/clients/test", g.handleConfigTest)
+		}
+	})
+	return r
 }
 
 // registerEnvClients wires the clients this deployment configures through the
@@ -159,41 +201,96 @@ func authMode(credentials bool, mode string) string {
 	return adapters.AuthNone
 }
 
+// addRequest is the POST /api/v1/downloads body. client and adapter are
+// aliases; either names a client id.
 type addRequest struct {
 	Adapter      string `json:"adapter"`
+	Client       string `json:"client"`
 	Source       string `json:"source"`
 	Title        string `json:"title"`
 	SavePath     string `json:"save_path"`
 	WantedItemID string `json:"wanted_item_id"`
+	// PayloadB64 is the NZB or .torrent content, base64-encoded. It is handed
+	// to the client instead of source.
+	PayloadB64  string `json:"payload_b64"`
+	PayloadName string `json:"payload_name"`
+	Category    string `json:"category"`
 }
 
 func (g *gateway) handleAdd(w http.ResponseWriter, r *http.Request) {
 	var req addRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Adapter == "" || req.Source == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "adapter and source are required"})
+	if !decodeJSON(w, r, maxAddBody, &req) {
 		return
 	}
-	ad := g.reg.Get(req.Adapter)
-	if ad == nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such adapter: " + req.Adapter})
+	id := req.Client
+	if id == "" {
+		id = req.Adapter
+	}
+	switch {
+	case req.Client != "" && req.Adapter != "" && req.Client != req.Adapter:
+		writeError(w, http.StatusBadRequest, "client and adapter name different clients")
+		return
+	case id == "" || (req.Source == "" && req.PayloadB64 == ""):
+		writeError(w, http.StatusBadRequest, "client (or adapter) and source or payload_b64 are required")
 		return
 	}
-	clientJobID, err := ad.Add(r.Context(), adapters.Job{
-		ID: req.WantedItemID, Source: req.Source, SavePath: req.SavePath, Title: req.Title,
+	var payload []byte
+	if req.PayloadB64 != "" {
+		var err error
+		if payload, err = base64.StdEncoding.DecodeString(req.PayloadB64); err != nil || len(payload) == 0 {
+			writeError(w, http.StatusBadRequest, "payload_b64 is not valid base64")
+			return
+		}
+	}
+
+	// The lease keeps a config push from dropping the client between the add
+	// reaching it and the job being tracked; it is released after track.
+	c, release, err := g.reg.Lease(id)
+	switch {
+	case errors.Is(err, adapters.ErrUnknownClient):
+		writeError(w, http.StatusNotFound, "no such client: "+id)
+		return
+	case errors.Is(err, adapters.ErrClientDraining):
+		writeError(w, http.StatusConflict, "client "+id+" was removed and accepts no new downloads")
+		return
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer release()
+
+	if ti, ok := adapters.LookupType(c.Type); ok && len(payload) > 0 && !ti.AcceptsPayload {
+		writeError(w, http.StatusBadRequest, c.Type+" does not accept a payload; send a source link")
+		return
+	}
+	savePath, category := req.SavePath, req.Category
+	if savePath == "" {
+		savePath = c.SavePath
+	}
+	if category == "" {
+		category = c.Category
+	}
+	clientJobID, err := c.Adapter.Add(r.Context(), adapters.Job{
+		ID: req.WantedItemID, Source: req.Source, SavePath: savePath, Title: req.Title,
+		Category: category, Payload: payload, PayloadName: req.PayloadName,
 	})
+	if errors.Is(err, adapters.ErrPayloadUnsupported) {
+		writeError(w, http.StatusBadRequest, c.Type+" does not accept a payload; send a source link")
+		return
+	}
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	g.track(&tracked{
-		adapter: req.Adapter, clientJobID: clientJobID,
+		adapter: id, clientType: c.Type, clientJobID: clientJobID,
 		title: req.Title, wantedItemID: req.WantedItemID, last: adapters.StatusQueued,
 		view: adapters.NewJobView(),
 	})
 	_ = g.pub.EmitStarted(r.Context(), events.Started{
-		ClientID: clientJobID, Adapter: req.Adapter, WantedItemID: req.WantedItemID, Title: req.Title,
+		ClientID: clientJobID, Adapter: id, ClientType: c.Type, WantedItemID: req.WantedItemID, Title: req.Title,
 	})
-	writeJSON(w, http.StatusAccepted, map[string]string{"adapter": req.Adapter, "client_job_id": clientJobID})
+	writeJSON(w, http.StatusAccepted, map[string]string{"adapter": id, "client": id, "client_job_id": clientJobID})
 }
 
 func (g *gateway) handleRemove(w http.ResponseWriter, r *http.Request) {
@@ -201,11 +298,11 @@ func (g *gateway) handleRemove(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	ad := g.reg.Get(name)
 	if ad == nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such adapter"})
+		writeError(w, http.StatusNotFound, "no such client")
 		return
 	}
 	if err := ad.Remove(r.Context(), id); err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	g.untrack(name, id)
@@ -257,13 +354,12 @@ func (g *gateway) handleControl(action string) http.HandlerFunc {
 		id := chi.URLParam(r, "id")
 		ad := g.reg.Get(name)
 		if ad == nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such adapter"})
+			writeError(w, http.StatusNotFound, "no such client")
 			return
 		}
 		ctrl, ok := ad.(adapters.Controller)
 		if !ok {
-			writeJSON(w, http.StatusNotImplemented,
-				map[string]string{"error": name + " cannot " + action})
+			writeError(w, http.StatusNotImplemented, name+" cannot "+action)
 			return
 		}
 		var err error
@@ -273,7 +369,7 @@ func (g *gateway) handleControl(action string) http.HandlerFunc {
 			err = ctrl.Resume(r.Context(), id)
 		}
 		if err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+			writeError(w, http.StatusBadGateway, err.Error())
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -283,22 +379,33 @@ func (g *gateway) handleControl(action string) http.HandlerFunc {
 // handleClientStatus reports per-client health + aggregate speed, so a console
 // can show "qBittorrent 4.2 MB/s · nzbget 18 MB/s, 2/2 news servers".
 func (g *gateway) handleClientStatus(w http.ResponseWriter, r *http.Request) {
-	names := g.reg.Names()
-	out := make([]adapters.ClientStatus, 0, len(names))
-	for _, name := range names {
-		rep, ok := g.reg.Get(name).(adapters.Reporter)
-		if !ok {
+	clients := g.reg.Active()
+	out := make([]adapters.ClientStatus, 0, len(clients))
+	for _, c := range clients {
+		var cs adapters.ClientStatus
+		if rep, ok := c.Adapter.(adapters.Reporter); ok {
+			cctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+			cs = rep.ClientStatus(cctx)
+			cancel()
+		} else {
 			// Don't invent health we never measured.
-			out = append(out, adapters.ClientStatus{
-				Name: name, Error: "status not supported by this adapter",
-			})
-			continue
+			cs = adapters.ClientStatus{Name: c.Adapter.Name(), Error: "status not supported by this adapter"}
 		}
-		cctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		out = append(out, rep.ClientStatus(cctx))
-		cancel()
+		cs.ID, cs.Type = c.ID, c.Type
+		out = append(out, cs)
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// handleReady is the readiness probe: the process serves and the event
+// publisher is up. Having no clients at all is still ready — clients arrive by
+// config push after the gateway is reachable.
+func (g *gateway) handleReady(w http.ResponseWriter, _ *http.Request) {
+	if g.stopping.Load() || !g.pub.Ready() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not ready"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
 func (g *gateway) track(t *tracked) {
@@ -307,10 +414,37 @@ func (g *gateway) track(t *tracked) {
 	g.mu.Unlock()
 }
 
+// trackIfAbsent tracks t unless the job is already tracked, and reports whether
+// it did. Adoption uses it so re-adopting after a config push never resets a
+// live job's state or forgets its wanted item.
+func (g *gateway) trackIfAbsent(t *tracked) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	key := t.adapter + ":" + t.clientJobID
+	if _, ok := g.jobs[key]; ok {
+		return false
+	}
+	g.jobs[key] = t
+	return true
+}
+
 func (g *gateway) untrack(adapter, id string) {
 	g.mu.Lock()
 	delete(g.jobs, adapter+":"+id)
 	g.mu.Unlock()
+}
+
+// hasJobs reports whether any job is still tracked on a client. The registry
+// calls it with its own lock held (see the lock order on gateway).
+func (g *gateway) hasJobs(clientID string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, t := range g.jobs {
+		if t.adapter == clientID {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *gateway) snapshot() []*tracked {
@@ -341,7 +475,8 @@ func (g *gateway) pollLoop(ctx context.Context) {
 }
 
 // pollAll polls every tracked job with bounded concurrency, so one slow client
-// cannot delay the others' updates.
+// cannot delay the others' updates. Afterwards, removed clients whose last job
+// just finished are dropped.
 func (g *gateway) pollAll(ctx context.Context) {
 	jobs := g.snapshot()
 	sem := make(chan struct{}, pollConcurrency)
@@ -356,11 +491,18 @@ func (g *gateway) pollAll(ctx context.Context) {
 		}(job)
 	}
 	wg.Wait()
+	for _, id := range g.reg.Reap(g.hasJobs) {
+		slog.Info("removed client drained; dropping it", "client", id)
+	}
 }
 
 func (g *gateway) pollOne(ctx context.Context, job *tracked) {
 	ad := g.reg.Get(job.adapter)
 	if ad == nil {
+		// Its client is gone entirely. Adds lease their client, so only a job
+		// adopted in a race with the client's removal can land here.
+		slog.Warn("client no longer configured; dropping job", "adapter", job.adapter, "id", job.clientJobID)
+		g.untrack(job.adapter, job.clientJobID)
 		return
 	}
 	pctx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -373,14 +515,14 @@ func (g *gateway) pollOne(ctx context.Context, job *tracked) {
 	switch v.State {
 	case adapters.StatusCompleted:
 		_ = g.pub.EmitCompleted(ctx, events.Completed{
-			ClientID: job.clientJobID, Adapter: job.adapter, WantedItemID: job.wantedItemID,
-			Files: v.Files, SizeBytes: v.BytesTotal,
+			ClientID: job.clientJobID, Adapter: job.adapter, ClientType: job.clientType,
+			WantedItemID: job.wantedItemID, Files: v.Files, SizeBytes: v.BytesTotal,
 		})
 		g.untrack(job.adapter, job.clientJobID)
 	case adapters.StatusFailed:
 		_ = g.pub.EmitFailed(ctx, events.Failed{
-			ClientID: job.clientJobID, Adapter: job.adapter, WantedItemID: job.wantedItemID,
-			Title: titleOf(job, v), Error: v.Message,
+			ClientID: job.clientJobID, Adapter: job.adapter, ClientType: job.clientType,
+			WantedItemID: job.wantedItemID, Title: titleOf(job, v), Error: v.Message,
 		})
 		g.untrack(job.adapter, job.clientJobID)
 	default:
@@ -391,8 +533,9 @@ func (g *gateway) pollOne(ctx context.Context, job *tracked) {
 				slog.Warn("job vanished from client; dropping",
 					"adapter", job.adapter, "id", job.clientJobID)
 				_ = g.pub.EmitFailed(ctx, events.Failed{
-					ClientID: job.clientJobID, Adapter: job.adapter, WantedItemID: job.wantedItemID,
-					Title: job.title, Error: "job is no longer known to " + job.adapter,
+					ClientID: job.clientJobID, Adapter: job.adapter, ClientType: job.clientType,
+					WantedItemID: job.wantedItemID,
+					Title:        job.title, Error: "job is no longer known to " + job.adapter,
 				})
 				g.untrack(job.adapter, job.clientJobID)
 				return
@@ -403,7 +546,7 @@ func (g *gateway) pollOne(ctx context.Context, job *tracked) {
 		pb, pt := g.prevSample(job)
 		fillDerived(&v, pb, pt)
 		_ = g.pub.EmitProgress(ctx, events.Progress{
-			ClientID: job.clientJobID, Adapter: job.adapter,
+			ClientID: job.clientJobID, Adapter: job.adapter, ClientType: job.clientType,
 			WantedItemID:    job.wantedItemID,
 			Title:           titleOf(job, v),
 			State:           string(v.State),
@@ -497,30 +640,46 @@ func (g *gateway) clearMissing(job *tracked) {
 // download is orphaned: it keeps downloading but never emits progress, and its
 // completion is never seen.
 func (g *gateway) adoptExisting(ctx context.Context) {
-	for _, name := range g.reg.Names() {
-		ad, ok := g.reg.Get(name).(adapters.Rehydrator)
-		if !ok {
-			continue
+	for _, id := range g.reg.Names() {
+		g.adopt(ctx, id)
+	}
+}
+
+// adopt re-attaches to one client's in-flight jobs. It runs at boot and after a
+// config push adds or replaces the client. It holds a lease like an add does,
+// so a push racing with it leaves the client draining instead of dropping it
+// under the jobs being tracked.
+func (g *gateway) adopt(ctx context.Context, id string) {
+	c, release, err := g.reg.Lease(id)
+	if err != nil {
+		return // removed again before adoption ran
+	}
+	defer release()
+	ad, ok := c.Adapter.(adapters.Rehydrator)
+	if !ok {
+		return
+	}
+	actx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	jobs, err := ad.Adopt(actx)
+	cancel()
+	if err != nil {
+		slog.Warn("adopt failed", "adapter", id, "err", err)
+		return
+	}
+	adopted := 0
+	for _, j := range jobs {
+		// wantedItemID is unknown after a restart; acquire re-associates by
+		// (adapter, client_job_id) from its own grabs table.
+		if g.trackIfAbsent(&tracked{
+			adapter: id, clientType: c.Type, clientJobID: j.ClientJobID,
+			title: j.Title, last: adapters.StatusQueued,
+			view: adapters.NewJobView(),
+		}) {
+			adopted++
 		}
-		actx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		jobs, err := ad.Adopt(actx)
-		cancel()
-		if err != nil {
-			slog.Warn("adopt failed", "adapter", name, "err", err)
-			continue
-		}
-		for _, j := range jobs {
-			// wantedItemID is unknown after a restart; acquire re-associates by
-			// (adapter, client_job_id) from its own grabs table.
-			g.track(&tracked{
-				adapter: name, clientJobID: j.ClientJobID,
-				title: j.Title, last: adapters.StatusQueued,
-				view: adapters.NewJobView(),
-			})
-		}
-		if len(jobs) > 0 {
-			slog.Info("adopted in-flight jobs after restart", "adapter", name, "count", len(jobs))
-		}
+	}
+	if adopted > 0 {
+		slog.Info("adopted in-flight jobs", "adapter", id, "count", adopted)
 	}
 }
 
@@ -553,6 +712,27 @@ func optCount(v int32) *int32 {
 		return nil
 	}
 	return &v
+}
+
+// decodeJSON reads a JSON body capped at limit bytes. When the body is
+// unusable it answers the request itself (400, or 413 past the cap) and
+// returns false.
+func decodeJSON(w http.ResponseWriter, r *http.Request, limit int64, v any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("request body exceeds %d MiB", limit>>20))
+			return false
+		}
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return false
+	}
+	return true
+}
+
+func writeError(w http.ResponseWriter, code int, msg string) {
+	writeJSON(w, code, map[string]string{"error": msg})
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

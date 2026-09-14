@@ -168,6 +168,13 @@ func (r *Registry) Names() []string {
 // List describes the clients that accept new downloads, sorted by id, without
 // secrets.
 func (r *Registry) List() []ClientInfo {
+	_, clients := r.Config()
+	return clients
+}
+
+// Config returns the revision of the last push together with the client list,
+// read under one lock so the two always match.
+func (r *Registry) Config() (int64, []ClientInfo) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := make([]ClientInfo, 0, len(r.clients))
@@ -180,7 +187,7 @@ func (r *Registry) List() []ClientInfo {
 		out = append(out, info)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out
+	return r.revision, out
 }
 
 // Revision is the revision of the last applied push; 0 when nothing was pushed.

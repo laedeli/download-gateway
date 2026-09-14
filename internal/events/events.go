@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/IBM/sarama"
@@ -42,9 +43,13 @@ const (
 
 // Started/Progress/Completed/Failed payloads mirror the Avro records in
 // stube/schemas/stube/download/*.avsc (snake_case, ms timestamps).
+//
+// Adapter is the client id — the field name predates configurable clients, and
+// an env client's id is still its type name. ClientType is the adapter type.
 type Started struct {
 	ClientID     string `json:"client_id"`
 	Adapter      string `json:"adapter"`
+	ClientType   string `json:"client_type"`
 	WantedItemID string `json:"wanted_item_id,omitempty"`
 	Title        string `json:"title"`
 	SizeBytes    *int64 `json:"size_bytes"`
@@ -54,6 +59,7 @@ type Started struct {
 type Progress struct {
 	ClientID     string `json:"client_id"`
 	Adapter      string `json:"adapter"`
+	ClientType   string `json:"client_type"`
 	WantedItemID string `json:"wanted_item_id,omitempty"`
 	Title        string `json:"title,omitempty"`
 	State        string `json:"state"`
@@ -79,6 +85,7 @@ type Progress struct {
 type Completed struct {
 	ClientID     string   `json:"client_id"`
 	Adapter      string   `json:"adapter"`
+	ClientType   string   `json:"client_type"`
 	WantedItemID string   `json:"wanted_item_id,omitempty"`
 	Files        []string `json:"files"`
 	SizeBytes    int64    `json:"size_bytes"`
@@ -88,6 +95,7 @@ type Completed struct {
 type Failed struct {
 	ClientID     string `json:"client_id"`
 	Adapter      string `json:"adapter"`
+	ClientType   string `json:"client_type"`
 	WantedItemID string `json:"wanted_item_id,omitempty"`
 	Title        string `json:"title,omitempty"`
 	Error        string `json:"error"`
@@ -102,6 +110,14 @@ type Failed struct {
 type Publisher struct {
 	p      sarama.SyncProducer
 	prefix string // <prefix>download.client.<kind>; defaults to "stube." when blank
+	closed atomic.Bool
+}
+
+// Ready reports whether the publisher can take events: it was built and has
+// not been closed. Scaffold (log-only) mode counts as ready — running without
+// Kafka is a supported configuration, not an outage.
+func (p *Publisher) Ready() bool {
+	return p != nil && !p.closed.Load()
 }
 
 // topicFor builds the full topic name for an event kind. Nil-safe: emit's
@@ -235,7 +251,11 @@ func (p *Publisher) EmitFailed(ctx context.Context, e Failed) error {
 
 // Close releases the producer.
 func (p *Publisher) Close() error {
-	if p == nil || p.p == nil {
+	if p == nil {
+		return nil
+	}
+	p.closed.Store(true)
+	if p.p == nil {
 		return nil
 	}
 	return p.p.Close()
