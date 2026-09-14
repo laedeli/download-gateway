@@ -122,7 +122,7 @@ func (s ClientSpec) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("id", s.ID),
 		slog.String("type", s.Type),
-		slog.String("base_url", redactURL(s.BaseURL)),
+		slog.String("base_url", RedactURL(s.BaseURL)),
 		slog.String("auth", s.Auth),
 		slog.String("category", s.Category),
 		slog.Bool("secret_set", s.Secret != ""),
@@ -150,7 +150,7 @@ func (s ClientSpec) info(source string) ClientInfo {
 		protocols = []string{}
 	}
 	return ClientInfo{
-		ID: s.ID, Type: s.Type, BaseURL: redactURL(s.BaseURL), Auth: s.Auth, Username: s.Username,
+		ID: s.ID, Type: s.Type, BaseURL: RedactURL(s.BaseURL), Auth: s.Auth, Username: s.Username,
 		Category: s.Category, SavePath: s.SavePath, Protocols: protocols,
 		Source: source, SecretSet: s.Secret != "",
 	}
@@ -267,8 +267,13 @@ func NewClient(spec ClientSpec) (Adapter, ClientSpec, error) {
 	if err != nil {
 		return nil, ClientSpec{}, err
 	}
+	return buildClient(s), s, nil
+}
+
+// buildClient builds the adapter for a spec PrepareSpec already accepted.
+func buildClient(s ClientSpec) Adapter {
 	ti, _ := LookupType(s.Type)
-	return ti.build(s), s, nil
+	return ti.build(s)
 }
 
 // specHash fingerprints everything that shapes an adapter, secret included, so
@@ -289,10 +294,10 @@ func specHash(s ClientSpec) [sha256.Size]byte {
 
 func isControl(r rune) bool { return r < 0x20 || r == 0x7f }
 
-// redactURL strips any userinfo from a URL before it is shown or logged. API
+// RedactURL strips any userinfo from a URL before it is shown or logged. API
 // clients cannot carry one (PrepareSpec refuses it), but an env URL might. A URL
 // that does not even parse is dropped rather than echoed.
-func redactURL(raw string) string {
+func RedactURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return ""

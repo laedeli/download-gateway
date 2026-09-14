@@ -61,25 +61,8 @@ func main() {
 
 	addr := envOr("DOWNLOAD_GATEWAY_ADDR", ":8080")
 
-	// Wire only the adapters this deployment is configured for (an adapter with
-	// no endpoint is omitted, not stubbed). oDownloader has a live prod instance;
-	// qBittorrent is the neutral torrent client for the laedeli acquisition addon.
-	var configured []adapters.Adapter
-	if base := os.Getenv("ODOWNLOADER_BASE_URL"); base != "" {
-		configured = append(configured, adapters.NewODownloader(base, os.Getenv("ODOWNLOADER_TOKEN")))
-		slog.Info("odownloader adapter configured", "base_url", base)
-	}
-	if base := os.Getenv("QBITTORRENT_BASE_URL"); base != "" {
-		configured = append(configured, adapters.NewQBittorrent(base,
-			os.Getenv("QBITTORRENT_USER"), os.Getenv("QBITTORRENT_PASS")))
-		slog.Info("qbittorrent adapter configured", "base_url", base)
-	}
-	if base := os.Getenv("NZBGET_URL"); base != "" {
-		configured = append(configured, adapters.NewNZBGet(base,
-			os.Getenv("NZBGET_USER"), os.Getenv("NZBGET_PASS"), os.Getenv("NZBGET_CATEGORY")))
-		slog.Info("nzbget adapter configured", "base_url", base)
-	}
-	reg := adapters.NewRegistry(configured...)
+	reg := adapters.NewRegistry()
+	registerEnvClients(reg)
 
 	pub, err := events.NewPublisher(events.ConfigFromEnv())
 	if err != nil {
@@ -138,6 +121,42 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
+}
+
+// registerEnvClients wires the clients this deployment configures through the
+// environment (a client with no endpoint is omitted, not stubbed). They keep
+// their historical ids — the type name — and are built exactly as before; the
+// spec only describes them for the config API, which cannot replace them.
+func registerEnvClients(reg *adapters.Registry) {
+	if base := os.Getenv("ODOWNLOADER_BASE_URL"); base != "" {
+		token := os.Getenv("ODOWNLOADER_TOKEN")
+		reg.AddEnv(adapters.ClientSpec{
+			BaseURL: base, Auth: authMode(token != "", adapters.AuthToken), Secret: token,
+		}, adapters.NewODownloader(base, token))
+		slog.Info("odownloader client configured from the environment", "base_url", adapters.RedactURL(base))
+	}
+	if base := os.Getenv("QBITTORRENT_BASE_URL"); base != "" {
+		user, pass := os.Getenv("QBITTORRENT_USER"), os.Getenv("QBITTORRENT_PASS")
+		reg.AddEnv(adapters.ClientSpec{
+			BaseURL: base, Auth: authMode(user != "", adapters.AuthBasic), Username: user, Secret: pass,
+		}, adapters.NewQBittorrent(base, user, pass))
+		slog.Info("qbittorrent client configured from the environment", "base_url", adapters.RedactURL(base))
+	}
+	if base := os.Getenv("NZBGET_URL"); base != "" {
+		user, pass, category := os.Getenv("NZBGET_USER"), os.Getenv("NZBGET_PASS"), os.Getenv("NZBGET_CATEGORY")
+		reg.AddEnv(adapters.ClientSpec{
+			BaseURL: base, Auth: authMode(user != "", adapters.AuthBasic), Username: user, Secret: pass,
+			Category: category,
+		}, adapters.NewNZBGet(base, user, pass, category))
+		slog.Info("nzbget client configured from the environment", "base_url", adapters.RedactURL(base))
+	}
+}
+
+func authMode(credentials bool, mode string) string {
+	if credentials {
+		return mode
+	}
+	return adapters.AuthNone
 }
 
 type addRequest struct {

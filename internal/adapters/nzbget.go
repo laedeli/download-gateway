@@ -31,7 +31,7 @@ type NZBGet struct {
 // LogValue keeps the password out of structured logs.
 func (n *NZBGet) LogValue() slog.Value {
 	return slog.GroupValue(
-		slog.String("base_url", redactURL(n.BaseURL)),
+		slog.String("base_url", RedactURL(n.BaseURL)),
 		slog.String("category", n.Category),
 		slog.Bool("password_set", n.Password != ""),
 	)

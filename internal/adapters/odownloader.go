@@ -39,7 +39,7 @@ func (o *ODownloader) Name() string { return "odownloader" }
 // LogValue keeps the bearer token out of structured logs.
 func (o *ODownloader) LogValue() slog.Value {
 	return slog.GroupValue(
-		slog.String("base_url", redactURL(o.BaseURL)),
+		slog.String("base_url", RedactURL(o.BaseURL)),
 		slog.Bool("token_set", o.Token != ""),
 	)
 }

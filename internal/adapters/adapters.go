@@ -157,34 +157,3 @@ type AdoptedJob struct {
 type Prober interface {
 	Probe(ctx context.Context) (version string, err error)
 }
-
-// Registry holds the configured adapters keyed by Adapter.Name().
-type Registry struct {
-	a map[string]Adapter
-}
-
-// NewRegistry returns a registry with the given adapters. Callers wire
-// the concrete adapters (with their endpoints/tokens) and pass them in;
-// an adapter that is not configured for this deployment is simply
-// omitted rather than registered as a stub.
-func NewRegistry(adapters ...Adapter) *Registry {
-	r := &Registry{a: map[string]Adapter{}}
-	for _, ad := range adapters {
-		if ad != nil {
-			r.a[ad.Name()] = ad
-		}
-	}
-	return r
-}
-
-// Names returns the registered adapter names.
-func (r *Registry) Names() []string {
-	out := make([]string, 0, len(r.a))
-	for k := range r.a {
-		out = append(out, k)
-	}
-	return out
-}
-
-// Get returns the adapter or nil.
-func (r *Registry) Get(name string) Adapter { return r.a[name] }

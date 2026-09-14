@@ -37,7 +37,7 @@ type QBittorrent struct {
 // LogValue keeps the password out of structured logs.
 func (q *QBittorrent) LogValue() slog.Value {
 	return slog.GroupValue(
-		slog.String("base_url", redactURL(q.BaseURL)),
+		slog.String("base_url", RedactURL(q.BaseURL)),
 		slog.String("category", q.Category),
 		slog.Bool("password_set", q.Password != ""),
 	)
