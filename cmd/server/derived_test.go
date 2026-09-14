@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"gitlab.nalet.cloud/stube/download-gateway/internal/adapters"
+	"github.com/laedeli/download-gateway/internal/adapters"
 )
 
 // NZBGet's listgroups carries no per-group DownloadRate, so a usenet download

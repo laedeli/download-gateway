@@ -15,9 +15,9 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"gitlab.nalet.cloud/stube/download-gateway/internal/adapters"
-	"gitlab.nalet.cloud/stube/download-gateway/internal/auth"
-	"gitlab.nalet.cloud/stube/download-gateway/internal/events"
+	"github.com/laedeli/download-gateway/internal/adapters"
+	"github.com/laedeli/download-gateway/internal/auth"
+	"github.com/laedeli/download-gateway/internal/events"
 )
 
 // tracked is one in-flight job the poll loop watches until it reaches a

@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM registry.nalet.cloud/infrastructure/library/golang:1.23-alpine AS build
+FROM registry.nalet.cloud/infrastructure/library/golang:1.24-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum* ./
 RUN go mod download || true
