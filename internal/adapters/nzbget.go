@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -66,8 +65,7 @@ func (n *NZBGet) call(ctx context.Context, method string, params ...any) (json.R
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-		return nil, fmt.Errorf("nzbget %s: %d %q", method, resp.StatusCode, strings.TrimSpace(string(b)))
+		return nil, newStatusError("nzbget "+method, resp)
 	}
 	var rpc struct {
 		Result json.RawMessage `json:"result"`
@@ -75,11 +73,15 @@ func (n *NZBGet) call(ctx context.Context, method string, params ...any) (json.R
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&rpc); err != nil {
+	limit := int64(maxResponse)
+	if method == "listgroups" || method == "history" {
+		limit = maxListResponse
+	}
+	if err := decodeCapped(resp.Body, limit, &rpc); err != nil {
 		return nil, err
 	}
 	if rpc.Error != nil {
-		return nil, fmt.Errorf("nzbget %s: %s", method, rpc.Error.Message)
+		return nil, fmt.Errorf("nzbget %s: %s", method, truncate(rpc.Error.Message, maxErrorDetail))
 	}
 	return rpc.Result, nil
 }
@@ -285,9 +287,12 @@ func (n *NZBGet) Probe(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// NZBGet answers a short token like "24.3". Anything else did not come from
+	// NZBGet, and a version is echoed back to whoever ran the test.
 	var version string
-	if err := json.Unmarshal(res, &version); err != nil {
-		return "", fmt.Errorf("nzbget version: bad result")
+	if err := json.Unmarshal(res, &version); err != nil || version == "" || len(version) > 32 ||
+		strings.ContainsFunc(version, func(r rune) bool { return r <= ' ' || strings.ContainsRune("<>{", r) }) {
+		return "", fmt.Errorf("nzbget version: the endpoint did not answer like NZBGet")
 	}
 	return version, nil
 }
@@ -298,7 +303,7 @@ func (n *NZBGet) ClientStatus(ctx context.Context) ClientStatus {
 	cs := ClientStatus{Name: n.Name()}
 	res, err := n.call(ctx, "status")
 	if err != nil {
-		cs.Error = err.Error()
+		cs.Error = PublicError(err)
 		return cs
 	}
 	var st struct {

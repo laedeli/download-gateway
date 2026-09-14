@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 )
 
@@ -53,11 +52,10 @@ func (o *ODownloader) Probe(ctx context.Context) (string, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-		return "", fmt.Errorf("odownloader probe: %d %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return "", newStatusError("odownloader probe", resp)
 	}
 	var page odlPage
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&page); err != nil {
+	if err := decodeCapped(resp.Body, maxResponse, &page); err != nil {
 		return "", fmt.Errorf("odownloader probe: the endpoint did not answer like the daemon API")
 	}
 	return "", nil
@@ -115,11 +113,10 @@ func (o *ODownloader) Add(ctx context.Context, j Job) (string, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return "", fmt.Errorf("odownloader add: %d %s", resp.StatusCode, string(b))
+		return "", newStatusError("odownloader add", resp)
 	}
 	var out odlAddResult
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := decodeCapped(resp.Body, maxResponse, &out); err != nil {
 		return "", err
 	}
 	if out.PackageID == "" {
@@ -154,11 +151,10 @@ func (o *ODownloader) Describe(ctx context.Context, packageID string) (JobView, 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return JobView{}, fmt.Errorf("odownloader describe: %d %s", resp.StatusCode, string(b))
+		return JobView{}, newStatusError("odownloader describe", resp)
 	}
 	var page odlPage
-	if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
+	if err := decodeCapped(resp.Body, maxListResponse, &page); err != nil {
 		return JobView{}, err
 	}
 	return foldODL(page.Content), nil
@@ -243,8 +239,7 @@ func (o *ODownloader) Remove(ctx context.Context, packageID string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 && resp.StatusCode != http.StatusNotFound {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("odownloader remove: %d %s", resp.StatusCode, string(b))
+		return newStatusError("odownloader remove", resp)
 	}
 	return nil
 }

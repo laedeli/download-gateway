@@ -133,7 +133,10 @@ the caller maps a finished download back to its request.
 
 `POST /api/v1/config/clients/test` takes one client object (the id is optional)
 and answers `200 {"reachable", "version", "error", "status"}`; a spec that does
-not validate is answered the same way with the reason in `error`.
+not validate is answered the same way with the reason in `error`. Errors name
+the HTTP status the endpoint answered with, never the body text it sent, and
+are at most 256 bytes. Client responses are read up to 1 MiB (32 MiB for job
+and history lists); anything larger is an error.
 
 ### Authentication
 

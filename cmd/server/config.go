@@ -100,6 +100,9 @@ type configTestResponse struct {
 // and checks that it reaches its endpoint with the given credentials. A spec
 // that does not validate is answered the same way, with the reason in error,
 // so a console can show every outcome in one place.
+//
+// The endpoint can be any address, so what it answered never comes back
+// verbatim: errors carry the HTTP status but no body text (PublicError).
 func (g *gateway) handleConfigTest(w http.ResponseWriter, r *http.Request) {
 	var spec adapters.ClientSpec
 	if !decodeJSON(w, r, maxConfigBody, &spec) {
@@ -127,7 +130,7 @@ func (g *gateway) handleConfigTest(w http.ResponseWriter, r *http.Request) {
 		out.Version, err = p.Probe(ctx)
 		cancel()
 		if err != nil {
-			fail(err.Error())
+			fail(adapters.PublicError(err))
 			return
 		}
 		out.Reachable = true

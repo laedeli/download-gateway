@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -208,6 +209,31 @@ func TestConfigTestEndpoint(t *testing.T) {
 		res := decode[configTestResponse](t, rec)
 		if rec.Code != http.StatusOK || res.Reachable || res.Error == "" || res.Status.Error == "" {
 			t.Errorf("%s: %d %+v", name, rec.Code, res)
+		}
+	}
+}
+
+// Whatever a tested endpoint answers stays out of the response: the status
+// code is reported, the body text is not.
+func TestConfigTestEndpointDoesNotEchoBodies(t *testing.T) {
+	iss := authtest.NewIssuer(t)
+	token := iss.Token(t, map[string]any{"azp": "acquire"})
+	tg := newTestGateway(t, nil, auth.NewVerifier(iss.URL, "acquire"))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "internal-body-text", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	for _, typ := range []string{"nzbget", "qbittorrent", "odownloader"} {
+		rec := tg.call(t, http.MethodPost, "/api/v1/config/clients/test", map[string]any{
+			"type": typ, "baseUrl": srv.URL, "auth": "none",
+		}, token)
+		res := decode[configTestResponse](t, rec)
+		if strings.Contains(rec.Body.String(), "internal-body-text") {
+			t.Errorf("%s: the endpoint's body came back: %s", typ, rec.Body)
+		}
+		if res.Reachable || !strings.Contains(res.Error, "HTTP 500") {
+			t.Errorf("%s: %+v, want the status code in error", typ, res)
 		}
 	}
 }

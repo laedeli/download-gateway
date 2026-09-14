@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -128,9 +127,8 @@ func (q *QBittorrent) login(ctx context.Context) error {
 		return fmt.Errorf("qbittorrent login: %w", err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("qbittorrent login failed: %d %q", resp.StatusCode, strings.TrimSpace(string(body)))
+		return newStatusError("qbittorrent login failed", resp)
 	}
 	return nil
 }
@@ -210,9 +208,9 @@ func (q *QBittorrent) Add(ctx context.Context, j Job) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorDetail))
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("qbittorrent add: %d %q", resp.StatusCode, strings.TrimSpace(string(body)))
+		return "", &StatusError{Op: "qbittorrent add", Code: resp.StatusCode, Detail: strings.TrimSpace(string(body))}
 	}
 	// qB replies 200 "Ok." on accept, 200 "Fails." when the source is unusable.
 	if strings.TrimSpace(string(body)) == "Fails." {
@@ -251,11 +249,10 @@ func (q *QBittorrent) byTag(ctx context.Context, tag string) (qbTorrent, bool, e
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-		return qbTorrent{}, false, fmt.Errorf("qbittorrent info: %d %q", resp.StatusCode, strings.TrimSpace(string(body)))
+		return qbTorrent{}, false, newStatusError("qbittorrent info", resp)
 	}
 	var list []qbTorrent
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+	if err := decodeCapped(resp.Body, maxListResponse, &list); err != nil {
 		return qbTorrent{}, false, fmt.Errorf("qbittorrent info decode: %w", err)
 	}
 	if len(list) == 0 {
@@ -307,8 +304,7 @@ func (q *QBittorrent) Remove(ctx context.Context, tag string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-		return fmt.Errorf("qbittorrent delete: %d %q", resp.StatusCode, strings.TrimSpace(string(body)))
+		return newStatusError("qbittorrent delete", resp)
 	}
 	return nil
 }
@@ -376,12 +372,14 @@ func (q *QBittorrent) control(ctx context.Context, tag string, verbs ...string) 
 			lastErr = err
 			continue
 		}
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		ok := resp.StatusCode >= 200 && resp.StatusCode < 300
+		if !ok {
+			lastErr = newStatusError("qbittorrent "+verb, resp)
+		}
 		resp.Body.Close()
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if ok {
 			return nil
 		}
-		lastErr = fmt.Errorf("qbittorrent %s: %d %q", verb, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return lastErr
 }
@@ -396,9 +394,9 @@ func (q *QBittorrent) Probe(ctx context.Context) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorDetail))
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("qbittorrent version: %d %q", resp.StatusCode, strings.TrimSpace(string(body)))
+		return "", &StatusError{Op: "qbittorrent version", Code: resp.StatusCode, Detail: strings.TrimSpace(string(body))}
 	}
 	// The WebUI answers a bare token like "v4.6.2". Anything else (an HTML page
 	// from whatever else listens there) is not a qBittorrent WebUI.
@@ -416,7 +414,7 @@ func (q *QBittorrent) ClientStatus(ctx context.Context) ClientStatus {
 		return q.get(ctx, "/api/v2/transfer/info", nil)
 	})
 	if err != nil {
-		cs.Error = err.Error()
+		cs.Error = PublicError(err)
 		return cs
 	}
 	defer resp.Body.Close()
@@ -429,15 +427,15 @@ func (q *QBittorrent) ClientStatus(ctx context.Context) ClientStatus {
 		UpSpeed          int64  `json:"up_info_speed"`
 		ConnectionStatus string `json:"connection_status"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
-		cs.Error = err.Error()
+	if err := decodeCapped(resp.Body, maxResponse, &info); err != nil {
+		cs.Error = PublicError(err)
 		return cs
 	}
 	cs.Reachable = true
 	cs.DownBps = info.DlSpeed
 	cs.UpBps = info.UpSpeed
 	if info.ConnectionStatus != "" {
-		cs.Detail = map[string]string{"connection": info.ConnectionStatus}
+		cs.Detail = map[string]string{"connection": truncate(info.ConnectionStatus, 32)}
 	}
 	return cs
 }
@@ -462,10 +460,10 @@ func (q *QBittorrent) Adopt(ctx context.Context) ([]AdoptedJob, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("qbittorrent info: %d", resp.StatusCode)
+		return nil, newStatusError("qbittorrent info", resp)
 	}
 	var list []qbTorrent
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+	if err := decodeCapped(resp.Body, maxListResponse, &list); err != nil {
 		return nil, err
 	}
 	var out []AdoptedJob
