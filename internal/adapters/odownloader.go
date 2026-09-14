@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -33,6 +35,33 @@ func NewODownloader(baseURL, token string) *ODownloader {
 }
 
 func (o *ODownloader) Name() string { return "odownloader" }
+
+// LogValue keeps the bearer token out of structured logs.
+func (o *ODownloader) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("base_url", redactURL(o.BaseURL)),
+		slog.Bool("token_set", o.Token != ""),
+	)
+}
+
+// Probe lists at most one download, which proves the endpoint and the token.
+// The daemon API has no version endpoint, so the version stays empty.
+func (o *ODownloader) Probe(ctx context.Context) (string, error) {
+	resp, err := o.do(ctx, http.MethodGet, "/api/v1/downloads?size=1", nil)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return "", fmt.Errorf("odownloader probe: %d %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var page odlPage
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&page); err != nil {
+		return "", fmt.Errorf("odownloader probe: the endpoint did not answer like the daemon API")
+	}
+	return "", nil
+}
 
 func (o *ODownloader) do(ctx context.Context, method, path string, body any) (*http.Response, error) {
 	var r io.Reader
@@ -70,7 +99,12 @@ type odlAddResult struct {
 	Rejected    []string `json:"rejected"`
 }
 
+// Add hands the daemon the hoster link. The daemon resolves links itself and
+// has no way to take file content, so a payload is refused.
 func (o *ODownloader) Add(ctx context.Context, j Job) (string, error) {
+	if len(j.Payload) > 0 {
+		return "", ErrPayloadUnsupported
+	}
 	resp, err := o.do(ctx, http.MethodPost, "/api/v1/links/add", odlAddRequest{
 		URLs:        []string{j.Source},
 		PackageName: j.Title,

@@ -3,7 +3,11 @@
 // knowing which protocol it'll travel over.
 package adapters
 
-import "context"
+import (
+	"context"
+	"errors"
+	"strings"
+)
 
 // Job represents one queued download.
 type Job struct {
@@ -11,6 +15,46 @@ type Job struct {
 	Source   string // torrent URL / NZB URL / magnet / hoster link
 	SavePath string
 	Title    string // human label for the UI / events
+	// Category is the client-side category for this job; empty means the
+	// client's own default.
+	Category string
+	// Payload is the NZB or .torrent file content. When set it is handed to the
+	// client instead of Source, so the client never needs the indexer's link
+	// (or the key embedded in it).
+	Payload     []byte
+	PayloadName string
+}
+
+// ErrPayloadUnsupported is returned by Add when the client type cannot take
+// file content, only a link.
+var ErrPayloadUnsupported = errors.New("this client type does not accept a payload")
+
+// payloadFileName is the file name a client is given for uploaded content: the
+// caller's name (else the title) reduced to its last path element with control
+// characters removed, always ending in ext.
+func payloadFileName(name, title, ext string) string {
+	clean := func(s string) string {
+		if i := strings.LastIndexAny(s, `/\`); i >= 0 {
+			s = s[i+1:]
+		}
+		return strings.TrimSpace(strings.Map(func(r rune) rune {
+			if isControl(r) {
+				return -1
+			}
+			return r
+		}, s))
+	}
+	out := clean(name)
+	if out == "" {
+		out = clean(title)
+	}
+	if out == "" {
+		out = "download"
+	}
+	if !strings.HasSuffix(strings.ToLower(out), ext) {
+		out += ext
+	}
+	return out
 }
 
 // Status is the lifecycle phase reported by an adapter.
@@ -61,6 +105,8 @@ func NewJobView() JobView {
 // console: is the client reachable, how fast is it going overall, and anything
 // client-specific worth surfacing (free disk, usenet server connections).
 type ClientStatus struct {
+	ID        string            `json:"id"`
+	Type      string            `json:"type"`
 	Name      string            `json:"name"`
 	Reachable bool              `json:"reachable"`
 	Error     string            `json:"error,omitempty"`
@@ -103,6 +149,13 @@ type Rehydrator interface {
 type AdoptedJob struct {
 	ClientJobID string
 	Title       string
+}
+
+// Prober is implemented by adapters that can check they reach their client and
+// that its credentials are accepted, without touching any job. It backs the
+// config test endpoint.
+type Prober interface {
+	Probe(ctx context.Context) (version string, err error)
 }
 
 // Registry holds the configured adapters keyed by Adapter.Name().

@@ -1,6 +1,7 @@
 package adapters
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -8,8 +9,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
+	"net/textproto"
 	"net/url"
 	"strings"
 	"time"
@@ -25,7 +29,18 @@ type QBittorrent struct {
 	BaseURL  string // e.g. http://qbittorrent.zaentrum-beta.svc:8080
 	Username string
 	Password string
+	// Category is the default category for new torrents; empty sends none.
+	Category string
 	HTTP     *http.Client
+}
+
+// LogValue keeps the password out of structured logs.
+func (q *QBittorrent) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("base_url", redactURL(q.BaseURL)),
+		slog.String("category", q.Category),
+		slog.Bool("password_set", q.Password != ""),
+	)
 }
 
 // NewQBittorrent builds the adapter with a cookie-jar HTTP client (the jar
@@ -45,13 +60,46 @@ func (q *QBittorrent) Name() string { return "qbittorrent" }
 // post issues a form POST. qB's CSRF guard rejects requests whose Referer/Origin
 // doesn't match the WebUI host, so we always set Referer to the base URL.
 func (q *QBittorrent) post(ctx context.Context, path string, form url.Values) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, q.BaseURL+path, strings.NewReader(form.Encode()))
+	return q.postBody(ctx, path, strings.NewReader(form.Encode()), "application/x-www-form-urlencoded")
+}
+
+func (q *QBittorrent) postBody(ctx context.Context, path string, body io.Reader, contentType string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, q.BaseURL+path, body)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Referer", q.BaseURL)
 	return q.HTTP.Do(req)
+}
+
+// torrentUpload encodes the add form plus the .torrent content as the
+// multipart body torrents/add expects for file uploads.
+func torrentUpload(fields url.Values, filename string, content []byte) ([]byte, string, error) {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	for key, values := range fields {
+		for _, v := range values {
+			if err := mw.WriteField(key, v); err != nil {
+				return nil, "", err
+			}
+		}
+	}
+	h := textproto.MIMEHeader{}
+	h.Set("Content-Disposition", mime.FormatMediaType("form-data",
+		map[string]string{"name": "torrents", "filename": filename}))
+	h.Set("Content-Type", "application/x-bittorrent")
+	part, err := mw.CreatePart(h)
+	if err != nil {
+		return nil, "", err
+	}
+	if _, err := part.Write(content); err != nil {
+		return nil, "", err
+	}
+	if err := mw.Close(); err != nil {
+		return nil, "", err
+	}
+	return buf.Bytes(), mw.FormDataContentType(), nil
 }
 
 func (q *QBittorrent) get(ctx context.Context, path string, query url.Values) (*http.Response, error) {
@@ -123,20 +171,41 @@ func (q *QBittorrent) hasSession() bool {
 }
 
 // Add attaches the torrent/magnet with a unique tag and returns that tag as the
-// stable clientJobID.
+// stable clientJobID. A payload is uploaded as a .torrent file (multipart
+// "torrents" part) and wins over the source URL.
 func (q *QBittorrent) Add(ctx context.Context, j Job) (string, error) {
 	tag := newJobTag()
 	form := url.Values{
-		"urls": {j.Source},
 		"tags": {tag},
 	}
 	if j.SavePath != "" {
 		form.Set("savepath", j.SavePath)
 		form.Set("autoTMM", "false") // honor the explicit save path, not a category default
 	}
-	resp, err := q.authed(ctx, func() (*http.Response, error) {
-		return q.post(ctx, "/api/v2/torrents/add", form)
-	})
+	category := j.Category
+	if category == "" {
+		category = q.Category
+	}
+	if category != "" {
+		form.Set("category", category)
+	}
+	var send func() (*http.Response, error)
+	if len(j.Payload) > 0 {
+		body, contentType, err := torrentUpload(form, payloadFileName(j.PayloadName, j.Title, ".torrent"), j.Payload)
+		if err != nil {
+			return "", err
+		}
+		send = func() (*http.Response, error) {
+			// A fresh reader per attempt: authed may resend after a re-login.
+			return q.postBody(ctx, "/api/v2/torrents/add", bytes.NewReader(body), contentType)
+		}
+	} else {
+		form.Set("urls", j.Source)
+		send = func() (*http.Response, error) {
+			return q.post(ctx, "/api/v2/torrents/add", form)
+		}
+	}
+	resp, err := q.authed(ctx, send)
 	if err != nil {
 		return "", err
 	}
@@ -168,6 +237,7 @@ type qbTorrent struct {
 	NumSeeds    int32   `json:"num_seeds"`
 	NumLeechs   int32   `json:"num_leechs"`
 	Tags        string  `json:"tags"`
+	Category    string  `json:"category"`
 }
 
 // byTag returns the torrent carrying our tag, or ok=false when it isn't present
@@ -316,6 +386,29 @@ func (q *QBittorrent) control(ctx context.Context, tag string, verbs ...string) 
 	return lastErr
 }
 
+// Probe logs in and reads the application version, which proves both the
+// endpoint and the credentials.
+func (q *QBittorrent) Probe(ctx context.Context) (string, error) {
+	resp, err := q.authed(ctx, func() (*http.Response, error) {
+		return q.get(ctx, "/api/v2/app/version", nil)
+	})
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("qbittorrent version: %d %q", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	// The WebUI answers a bare token like "v4.6.2". Anything else (an HTML page
+	// from whatever else listens there) is not a qBittorrent WebUI.
+	version := strings.TrimSpace(string(body))
+	if version == "" || len(version) > 32 || strings.ContainsAny(version, " \t\r\n<>{") {
+		return "", fmt.Errorf("qbittorrent version: the endpoint did not answer like a qBittorrent WebUI")
+	}
+	return version, nil
+}
+
 // ClientStatus reports qBittorrent's global transfer state.
 func (q *QBittorrent) ClientStatus(ctx context.Context) ClientStatus {
 	cs := ClientStatus{Name: q.Name()}
@@ -356,6 +449,10 @@ func (q *QBittorrent) ClientStatus(ctx context.Context) ClientStatus {
 // Finished torrents keep their tag and keep seeding forever, so they are
 // skipped: re-adopting one would fold to Completed on the next poll and replay
 // a completed event (re-triggering ingest) on every restart.
+//
+// When this client has a category, a torrent filed under a different category
+// belongs to another client on the same instance and is left alone. Torrents
+// with no category are still adopted: they predate per-client categories.
 func (q *QBittorrent) Adopt(ctx context.Context) ([]AdoptedJob, error) {
 	resp, err := q.authed(ctx, func() (*http.Response, error) {
 		return q.get(ctx, "/api/v2/torrents/info", nil)
@@ -375,6 +472,9 @@ func (q *QBittorrent) Adopt(ctx context.Context) ([]AdoptedJob, error) {
 	for _, t := range list {
 		if v := foldQB(t); v.State == StatusCompleted || v.State == StatusFailed {
 			continue // already terminal — do not replay its event
+		}
+		if q.Category != "" && t.Category != "" && t.Category != q.Category {
+			continue // another client's torrent
 		}
 		for _, tag := range strings.Split(t.Tags, ",") {
 			if tag = strings.TrimSpace(tag); strings.HasPrefix(tag, jobTagPrefix) {

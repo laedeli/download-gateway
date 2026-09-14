@@ -3,6 +3,7 @@ package adapters
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,15 +16,25 @@ import (
 
 // NZBGet drives an NZBGet instance over its JSON-RPC API
 // (POST {BaseURL}/jsonrpc, HTTP basic auth ControlUsername/Password). It adds an
-// NZB by handing NZBGet the release's URL (NZBGet fetches it — Prowlarr download
-// URLs embed the apikey), and folds listgroups (active) + history (terminal)
-// into the gateway's JobView. The clientJobID is NZBGet's integer NZBID.
+// NZB either by uploading the file content (the caller fetched it, so the
+// indexer link and its key never reach NZBGet) or by handing NZBGet a URL to
+// fetch, and folds listgroups (active) + history (terminal) into the gateway's
+// JobView. The clientJobID is NZBGet's integer NZBID.
 type NZBGet struct {
 	BaseURL  string
 	Username string
 	Password string
 	Category string
 	HTTP     *http.Client
+}
+
+// LogValue keeps the password out of structured logs.
+func (n *NZBGet) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("base_url", redactURL(n.BaseURL)),
+		slog.String("category", n.Category),
+		slog.Bool("password_set", n.Password != ""),
+	)
 }
 
 func NewNZBGet(baseURL, user, pass, category string) *NZBGet {
@@ -73,18 +84,29 @@ func (n *NZBGet) call(ctx context.Context, method string, params ...any) (json.R
 	return rpc.Result, nil
 }
 
-// Add appends the NZB by URL. NZBGet's append takes the URL as NZBContent and
-// fetches it. Returns the new NZBID as the clientJobID.
+// Add appends the NZB. NZBGet's append takes NZBContent as either base64 file
+// content or a URL it fetches itself; a payload wins over the source. Returns
+// the new NZBID as the clientJobID.
 func (n *NZBGet) Add(ctx context.Context, j Job) (string, error) {
 	name := strings.TrimSpace(j.Title)
 	if name == "" {
 		name = "download"
 	}
+	filename, content := name+".nzb", j.Source
+	if len(j.Payload) > 0 {
+		// NZBGet requires the filename's extension to match the content.
+		filename = payloadFileName(j.PayloadName, name, ".nzb")
+		content = base64.StdEncoding.EncodeToString(j.Payload)
+	}
+	category := j.Category
+	if category == "" {
+		category = n.Category
+	}
 	// append(NZBFilename, NZBContent(URL|base64), Category, Priority, AddToTop,
 	//        AddPaused, DupeKey, DupeScore, DupeMode). DupeMode must be a valid
 	// enum — FORCE always adds (a request should never be silently deduped away).
 	res, err := n.call(ctx, "append",
-		name+".nzb", j.Source, n.Category, 0, false, false, "", 0, "FORCE")
+		filename, content, category, 0, false, false, "", 0, "FORCE")
 	if err != nil {
 		return "", err
 	}
@@ -254,6 +276,20 @@ func (n *NZBGet) edit(ctx context.Context, id, command string) error {
 	}
 	_, err = n.call(ctx, "editqueue", command, 0, "", []int{want})
 	return err
+}
+
+// Probe asks NZBGet for its version, which proves both the endpoint and the
+// control credentials.
+func (n *NZBGet) Probe(ctx context.Context) (string, error) {
+	res, err := n.call(ctx, "version")
+	if err != nil {
+		return "", err
+	}
+	var version string
+	if err := json.Unmarshal(res, &version); err != nil {
+		return "", fmt.Errorf("nzbget version: bad result")
+	}
+	return version, nil
 }
 
 // ClientStatus reports NZBGet's global download state, including whether any
