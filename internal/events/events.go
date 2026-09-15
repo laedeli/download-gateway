@@ -1,8 +1,8 @@
 // Package events publishes the download lifecycle on Kafka topics
 // stube.download.client.{started,progress,completed,failed} per
-// ADR-009/ADR-019. Authentication to the platform-kafka cluster is
-// mTLS (Strimzi-issued client cert from the stube-download-gateway
-// KafkaUser secret) — NOT OAuth/SASL.
+// ADR-009/ADR-019. Authentication to a shared cluster is mTLS (a client
+// cert, e.g. from a Strimzi KafkaUser secret) — NOT OAuth/SASL; a
+// plaintext listener (a bundled broker) needs no TLS material at all.
 //
 // v1 wire format is JSON keyed by "adapter:client_id" (the composite
 // key per ADR-020 F3). The Avro schemas in stube/schemas/stube/download/
@@ -132,9 +132,12 @@ func (p *Publisher) topicFor(kind string) string {
 
 // Config controls how the producer authenticates.
 type Config struct {
-	Brokers string // comma-separated host:port (TLS listener :9093)
-	// mTLS material. Mounted from the KafkaUser secret. When CertFile is
-	// empty the publisher runs in scaffold (log-only) mode.
+	// Brokers is a comma-separated host:port list. Empty runs the publisher in
+	// scaffold (log-only) mode.
+	Brokers string
+	// mTLS material, e.g. the files of a KafkaUser secret. With none of the
+	// three set the producer connects in plaintext; with any of them set it
+	// uses mTLS and needs the certificate and key.
 	CertFile string
 	KeyFile  string
 	CAFile   string
@@ -158,34 +161,55 @@ func ConfigFromEnv() Config {
 	}
 }
 
-// NewPublisher connects to Kafka over mTLS. If brokers or cert material
-// is missing it returns a scaffold publisher (nil producer) rather than
-// an error, so the service stays up and logs what it would emit.
+// NewPublisher connects to Kafka: over mTLS when TLS material is configured,
+// in plaintext when none is. Without brokers it returns a scaffold publisher
+// (nil producer) rather than an error, so the service stays up and logs what
+// it would emit.
 func NewPublisher(c Config) (*Publisher, error) {
-	if c.Brokers == "" || c.CertFile == "" {
-		slog.Warn("kafka not configured; running events in scaffold (log-only) mode",
-			"brokers_set", c.Brokers != "", "cert_set", c.CertFile != "")
+	if c.Brokers == "" {
+		slog.Warn("kafka not configured (no KAFKA_BROKERS); running events in scaffold (log-only) mode")
 		return &Publisher{prefix: c.TopicPrefix}, nil
 	}
-	tlsCfg, err := mTLS(c)
+	cfg, err := producerConfig(c)
 	if err != nil {
-		return nil, fmt.Errorf("kafka mTLS: %w", err)
+		return nil, err
 	}
+	p, err := newSyncProducer(strings.Split(c.Brokers, ","), cfg)
+	if err != nil {
+		return nil, err
+	}
+	mode := "plaintext"
+	if cfg.Net.TLS.Enable {
+		mode = "mTLS"
+	}
+	slog.Info("kafka producer connected", "mode", mode, "brokers", c.Brokers, "topic_prefix", c.TopicPrefix)
+	return &Publisher{p: p, prefix: c.TopicPrefix}, nil
+}
+
+// newSyncProducer is sarama's constructor, which dials the brokers; tests
+// replace it to inspect the configuration without one.
+var newSyncProducer = sarama.NewSyncProducer
+
+// producerConfig is the idempotent producer's configuration: mTLS when any TLS
+// file is set, which then needs the certificate and key, so an incomplete set
+// fails instead of falling back to plaintext.
+func producerConfig(c Config) (*sarama.Config, error) {
 	cfg := sarama.NewConfig()
 	cfg.Producer.Return.Successes = true
 	cfg.Producer.RequiredAcks = sarama.WaitForAll
 	cfg.Producer.Idempotent = true
 	cfg.Net.MaxOpenRequests = 1
+	cfg.Version = sarama.V3_5_0_0
+	if c.CertFile == "" && c.KeyFile == "" && c.CAFile == "" {
+		return cfg, nil
+	}
+	tlsCfg, err := mTLS(c)
+	if err != nil {
+		return nil, fmt.Errorf("kafka mTLS: %w", err)
+	}
 	cfg.Net.TLS.Enable = true
 	cfg.Net.TLS.Config = tlsCfg
-	cfg.Version = sarama.V3_5_0_0
-
-	p, err := sarama.NewSyncProducer(strings.Split(c.Brokers, ","), cfg)
-	if err != nil {
-		return nil, err
-	}
-	slog.Info("kafka producer connected (mTLS)", "brokers", c.Brokers, "topic_prefix", c.TopicPrefix)
-	return &Publisher{p: p, prefix: c.TopicPrefix}, nil
+	return cfg, nil
 }
 
 func mTLS(c Config) (*tls.Config, error) {

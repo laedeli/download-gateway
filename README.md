@@ -163,7 +163,7 @@ up.
 ## Events
 
 A poll loop describes each tracked job (`POLL_INTERVAL`, default `5s`) and
-publishes JSON to Kafka over mTLS on `<KAFKA_TOPIC_PREFIX>download.client.<kind>`:
+publishes JSON to Kafka on `<KAFKA_TOPIC_PREFIX>download.client.<kind>`:
 
 | Kind | When | Carries |
 |---|---|---|
@@ -173,8 +173,12 @@ publishes JSON to Kafka over mTLS on `<KAFKA_TOPIC_PREFIX>download.client.<kind>
 | `failed` | the client reports failure, or the job vanished for 10 minutes | `error` |
 
 Every event has `client_id` (the client's job id), `adapter` (the client id —
-for environment clients still the type name) and `client_type`. Without Kafka
-the publisher runs in log-only mode and the service stays ready.
+for environment clients still the type name) and `client_type`.
+
+The brokers are reached over mTLS when any of `KAFKA_TLS_CERT`, `KAFKA_TLS_KEY`
+and `KAFKA_TLS_CA` is set (the certificate and key are then required), and in
+plaintext when none is. Without `KAFKA_BROKERS` the publisher runs in log-only
+mode and the service stays ready.
 
 ## Configuration
 
@@ -184,8 +188,8 @@ the publisher runs in log-only mode and the service stays ready.
 | `POLL_INTERVAL` | `5s` | job poll cadence |
 | `OIDC_ISSUER` | — | require bearer tokens from this issuer |
 | `ALLOWED_CLIENTS` | — | comma list of OIDC client ids allowed to call; enables the config API |
-| `KAFKA_BROKERS` | — | bootstrap servers (TLS listener) |
-| `KAFKA_TLS_CERT` / `KAFKA_TLS_KEY` / `KAFKA_TLS_CA` | — | mTLS material |
+| `KAFKA_BROKERS` | — | bootstrap servers; unset runs events log-only |
+| `KAFKA_TLS_CERT` / `KAFKA_TLS_KEY` / `KAFKA_TLS_CA` | — | mTLS material; none set connects in plaintext |
 | `KAFKA_TOPIC_PREFIX` | `stube.` | topic namespace |
 | `NZBGET_URL` / `NZBGET_USER` / `NZBGET_PASS` / `NZBGET_CATEGORY` | — | environment client `nzbget` |
 | `QBITTORRENT_BASE_URL` / `QBITTORRENT_USER` / `QBITTORRENT_PASS` | — | environment client `qbittorrent` |
