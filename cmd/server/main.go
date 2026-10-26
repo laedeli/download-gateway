@@ -298,7 +298,9 @@ func (g *gateway) handleAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+		// The client's own word, without its address or its body text: an
+		// adapter's refusal ("… rejected the source") is kept.
+		writeError(w, http.StatusBadGateway, adapters.PublicError(err))
 		return
 	}
 	g.track(&tracked{
@@ -321,7 +323,7 @@ func (g *gateway) handleRemove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := ad.Remove(r.Context(), id); err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeError(w, http.StatusBadGateway, adapters.PublicError(err))
 		return
 	}
 	g.untrack(name, id)
@@ -445,7 +447,7 @@ func (g *gateway) handleControl(action string) http.HandlerFunc {
 			err = ctrl.Resume(r.Context(), id)
 		}
 		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeError(w, http.StatusBadGateway, adapters.PublicError(err))
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)

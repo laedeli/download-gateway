@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"strconv"
 	"strings"
@@ -17,13 +20,15 @@ import (
 
 // fakeAdapter is a client that numbers its jobs from 1 and describes them from
 // views; a job it has no view of is one it does not know. err, when set, is a
-// client that cannot be asked.
+// client that cannot be asked; opErr fails its adds, removes, pauses and
+// resumes.
 type fakeAdapter struct {
 	mu    sync.Mutex
 	name  string
 	next  int
 	views map[string]adapters.JobView
 	err   error
+	opErr error
 }
 
 func newFakeAdapter(name string) *fakeAdapter {
@@ -35,6 +40,9 @@ func (f *fakeAdapter) Name() string { return f.name }
 func (f *fakeAdapter) Add(context.Context, adapters.Job) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.opErr != nil {
+		return "", f.opErr
+	}
 	f.next++
 	return strconv.Itoa(f.next), nil
 }
@@ -58,7 +66,23 @@ func (f *fakeAdapter) Describe(_ context.Context, id string) (adapters.JobView, 
 	return v, nil
 }
 
-func (f *fakeAdapter) Remove(context.Context, string) error { return nil }
+func (f *fakeAdapter) Remove(context.Context, string) error { return f.op() }
+
+func (f *fakeAdapter) Pause(context.Context, string) error { return f.op() }
+
+func (f *fakeAdapter) Resume(context.Context, string) error { return f.op() }
+
+func (f *fakeAdapter) op() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.opErr
+}
+
+func (f *fakeAdapter) failOps(err error) {
+	f.mu.Lock()
+	f.opErr = err
+	f.mu.Unlock()
+}
 
 func (f *fakeAdapter) set(id string, v adapters.JobView) {
 	f.mu.Lock()
@@ -182,5 +206,47 @@ func TestDescribeRequiresAllowedClient(t *testing.T) {
 	}
 	if rec := tg.call(t, http.MethodGet, "/api/v1/downloads/usenet/1", nil, iss.Token(t, map[string]any{"azp": "acquire"})); rec.Code != http.StatusOK {
 		t.Errorf("from the allowed client = %d %s", rec.Code, rec.Body)
+	}
+}
+
+// The add, remove and pause/resume routes answer a client's failure with the
+// method and the cause, or the HTTP status it answered with — never the
+// client's address, nor the body text it sent —; an adapter's own refusal
+// reads as it was, which is how the caller tells a release the client
+// refused.
+func TestJobRoutesKeepTheClientsAddressOut(t *testing.T) {
+	fake := newFakeAdapter("usenet")
+	tg := newTestGateway(t, adapters.NewRegistry(fake), openVerifier())
+	routes := map[string]func() *httptest.ResponseRecorder{
+		"add": func() *httptest.ResponseRecorder {
+			return tg.call(t, http.MethodPost, "/api/v1/downloads", map[string]any{"client": "usenet", "source": "https://indexer.example/get/1"}, "")
+		},
+		"remove": func() *httptest.ResponseRecorder {
+			return tg.call(t, http.MethodDelete, "/api/v1/downloads/usenet/3", nil, "")
+		},
+		"pause": func() *httptest.ResponseRecorder {
+			return tg.call(t, http.MethodPost, "/api/v1/downloads/usenet/3/pause", nil, "")
+		},
+		"resume": func() *httptest.ResponseRecorder {
+			return tg.call(t, http.MethodPost, "/api/v1/downloads/usenet/3/resume", nil, "")
+		},
+	}
+	unreached := fmt.Errorf("nzbget append: %w", &url.Error{Op: "Post", URL: "http://admin:secret@nzbget.example:6789/jsonrpc",
+		Err: errors.New("dial tcp: lookup nzbget.example: no such host")})
+	answered := &adapters.StatusError{Op: "nzbget editqueue", Code: http.StatusInternalServerError, Detail: "<html>stack trace</html>"}
+	for name, call := range routes {
+		for _, failure := range []error{unreached, answered} {
+			fake.failOps(failure)
+			rec := call()
+			msg := decode[map[string]string](t, rec)["error"]
+			if rec.Code != http.StatusBadGateway || msg == "" || strings.Contains(msg, "http://") || strings.Contains(msg, "/jsonrpc") ||
+				strings.Contains(msg, "stack trace") {
+				t.Errorf("%s with %v = %d %q", name, failure, rec.Code, msg)
+			}
+		}
+	}
+	fake.failOps(errors.New("nzbget append rejected the source (id=0)"))
+	if msg := decode[map[string]string](t, routes["add"]())["error"]; msg != "nzbget append rejected the source (id=0)" {
+		t.Errorf("an adapter's refusal reads %q", msg)
 	}
 }
