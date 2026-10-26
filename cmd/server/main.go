@@ -167,6 +167,7 @@ func (g *gateway) routes(verifier *auth.Verifier) http.Handler {
 		r.Post("/api/v1/downloads", g.handleAdd)
 		r.Delete("/api/v1/downloads/{adapter}/{id}", g.handleRemove)
 		r.Get("/api/v1/downloads", g.handleList)
+		r.Get("/api/v1/downloads/{adapter}/{id}", g.handleDescribe)
 		r.Post("/api/v1/downloads/{adapter}/{id}/pause", g.handleControl("pause"))
 		r.Post("/api/v1/downloads/{adapter}/{id}/resume", g.handleControl("resume"))
 		// Whoever can push client configuration can point the gateway at any
@@ -360,6 +361,63 @@ func (g *gateway) handleList(w http.ResponseWriter, _ *http.Request) {
 			EtaSec:  optInt32(v.EtaSec),
 			Seeders: optCount(v.Seeders), Leechers: optCount(v.Leechers), Health: optCount(v.Health),
 		})
+	}
+	g.mu.Unlock()
+	writeJSON(w, http.StatusOK, out)
+}
+
+// describeDTO is one job as its client describes it now, for
+// GET /api/v1/downloads/{adapter}/{id}: the list's fields, the files of a
+// completed job (absolute paths, as the client reports them) and the client's
+// message.
+type describeDTO struct {
+	jobDTO
+	Files   []string `json:"files,omitempty"`
+	Message string   `json:"message,omitempty"`
+}
+
+// handleDescribe answers one job as its client describes it now — a finished
+// one too, which the gateway stops tracking once it ends: NZBGet reads its
+// history, qBittorrent the torrent. It is how a caller learns what became of a
+// job whose events it never saw. The wanted item id is the tracked job's; a
+// job the gateway does not track has none.
+//
+// An unknown client and a job the client does not know are both 404; the
+// second carries native_state "not-found", so a caller can tell them apart. A
+// client that cannot be asked is 502.
+func (g *gateway) handleDescribe(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "adapter")
+	id := chi.URLParam(r, "id")
+	ad := g.reg.Get(name)
+	if ad == nil {
+		writeError(w, http.StatusNotFound, "no such client")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	v, err := ad.Describe(ctx, id)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, adapters.PublicError(err))
+		return
+	}
+	if v.NativeState == adapters.NotFoundState {
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error": name + " does not know job " + id, "adapter": name, "client_job_id": id,
+			"native_state": adapters.NotFoundState,
+		})
+		return
+	}
+	out := describeDTO{Files: v.Files, Message: v.Message}
+	out.jobDTO = jobDTO{
+		Adapter: name, ClientJobID: id, Title: v.Title, State: string(v.State), NativeState: v.NativeState,
+		ProgressPct: pct(v.BytesDone, v.BytesTotal), Downloaded: v.BytesDone,
+		SizeBytes: optInt64(v.BytesTotal), SpeedBps: v.SpeedBps,
+		EtaSec:  optInt32(v.EtaSec),
+		Seeders: optCount(v.Seeders), Leechers: optCount(v.Leechers), Health: optCount(v.Health),
+	}
+	g.mu.Lock()
+	if t := g.jobs[name+":"+id]; t != nil {
+		out.WantedItemID, out.Title = t.wantedItemID, titleOf(t, v)
 	}
 	g.mu.Unlock()
 	writeJSON(w, http.StatusOK, out)

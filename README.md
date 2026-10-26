@@ -59,6 +59,7 @@ Clients come from two places:
 | `GET` | `/api/v1/clients/status` | per-client health and throughput (`id`, `type`, `reachable`, speeds, detail) |
 | `POST` | `/api/v1/downloads` | add a download → `202 {adapter, client, client_job_id}` |
 | `GET` | `/api/v1/downloads` | tracked in-flight jobs with their last snapshot |
+| `GET` | `/api/v1/downloads/{client}/{id}` | one job as its client describes it now, finished jobs too (see [describing a job](#describing-a-job)) |
 | `DELETE` | `/api/v1/downloads/{client}/{id}` | remove a job from its client (qBittorrent keeps the files) |
 | `POST` | `/api/v1/downloads/{client}/{id}/pause` · `/resume` | pause or resume, where the type supports it |
 | `GET` | `/api/v1/config/types` | the adapter types a client can be created from |
@@ -94,6 +95,35 @@ Clients come from two places:
 
 `wanted_item_id` is stamped onto the job and echoed on the `completed` event so
 the caller maps a finished download back to its request.
+
+### Describing a job
+
+`GET /api/v1/downloads/{client}/{id}` asks the client about one job now,
+whether or not the gateway still tracks it: NZBGet reads its queue and then its
+history, qBittorrent the torrent. It is how the caller learns what became of a
+job whose events it never saw — a completed event lost, or the gateway
+restarted after the job finished (adoption only re-attaches jobs still
+running).
+
+```json
+{"adapter": "usenet", "client_job_id": "3", "wanted_item_id": "w_123",
+ "title": "Example.Title.1080p", "state": "completed", "native_state": "SUCCESS/ALL",
+ "progress_pct": 100, "downloaded_bytes": 1073741824, "size_bytes": 1073741824,
+ "speed_bps": 0, "eta_sec": null,
+ "files": ["/downloads/complete/Example.Title.1080p"]}
+```
+
+- The fields are the list's, plus `files` (absolute paths as the client
+  reports them, set once the job completed) and `message` (the client's word
+  on a failure).
+- `wanted_item_id` is set only while the gateway tracks the job.
+- An unknown client is `404 {"error": "no such client"}`; a job the client does
+  not know is `404` too, with `"native_state": "not-found"` in the body. A
+  client that cannot be asked is `502`.
+- Job ids are the client's, and a client may give one again: NZBGet numbers
+  its jobs from 1 once it restarts with an empty history. The job an id names
+  is the one the client holds under it now, not necessarily the one an older
+  add was answered with.
 
 ### Configuring clients
 
