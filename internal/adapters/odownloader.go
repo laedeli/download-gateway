@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -143,9 +144,11 @@ type odlPage struct {
 	Content []odlDownloadView `json:"content"`
 }
 
-// Describe lists the package's downloads and folds them into one JobView.
+// Describe lists the package's downloads and folds them into one JobView. The
+// id is the caller's, so it goes into the query escaped: it names one package
+// and adds no parameter of its own.
 func (o *ODownloader) Describe(ctx context.Context, packageID string) (JobView, error) {
-	resp, err := o.do(ctx, http.MethodGet, "/api/v1/downloads?packageId="+packageID+"&size=1000", nil)
+	resp, err := o.do(ctx, http.MethodGet, "/api/v1/downloads?packageId="+url.QueryEscape(packageID)+"&size=1000", nil)
 	if err != nil {
 		return JobView{}, err
 	}
@@ -232,8 +235,9 @@ func (o *ODownloader) Status(ctx context.Context, packageID string) (Status, err
 	return v.State, nil
 }
 
+// Remove deletes the package, its id escaped as one path segment.
 func (o *ODownloader) Remove(ctx context.Context, packageID string) error {
-	resp, err := o.do(ctx, http.MethodDelete, "/api/v1/packages/"+packageID, nil)
+	resp, err := o.do(ctx, http.MethodDelete, "/api/v1/packages/"+url.PathEscape(packageID), nil)
 	if err != nil {
 		return err
 	}
