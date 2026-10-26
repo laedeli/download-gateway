@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -64,6 +65,13 @@ func TestPublicError(t *testing.T) {
 	}
 	if PublicError(nil) != "" {
 		t.Error("PublicError(nil) is not empty")
+	}
+	// A request that got no answer names the client's address; the method and
+	// the cause are what is passed on.
+	unreached := fmt.Errorf("nzbget describe 3: %w", &url.Error{Op: "Post", URL: "http://admin:secret@nzbget.example:6789/jsonrpc",
+		Err: errors.New("dial tcp: lookup nzbget.example: no such host")})
+	if got := PublicError(unreached); got != "nzbget describe 3: Post: dial tcp: lookup nzbget.example: no such host" {
+		t.Errorf("PublicError of a request with no answer = %q", got)
 	}
 }
 

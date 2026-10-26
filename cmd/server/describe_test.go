@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
@@ -147,6 +148,19 @@ func TestDescribeAnswersWhatItCannotDescribe(t *testing.T) {
 	rec = tg.call(t, http.MethodGet, "/api/v1/downloads/usenet/3", nil, "")
 	if body := decode[map[string]string](t, rec); rec.Code != http.StatusBadGateway || body["error"] != "nzbget listgroups: HTTP 500" {
 		t.Fatalf("a client answering an error = %d %v", rec.Code, body)
+	}
+}
+
+// A client out of reach answers 502 with the method and the cause of the
+// failed request, never the client's address.
+func TestDescribeKeepsTheClientsAddressOut(t *testing.T) {
+	reg := adapters.NewRegistry(adapters.NewNZBGet("http://admin:secret@127.0.0.1:1", "admin", "secret", ""))
+	tg := newTestGateway(t, reg, openVerifier())
+	rec := tg.call(t, http.MethodGet, "/api/v1/downloads/nzbget/3", nil, "")
+	body := decode[map[string]string](t, rec)
+	if rec.Code != http.StatusBadGateway || !strings.Contains(body["error"], "Post: ") ||
+		strings.Contains(body["error"], "http://") || strings.Contains(body["error"], "/jsonrpc") || strings.Contains(body["error"], "secret") {
+		t.Fatalf("a client out of reach = %d %q", rec.Code, body["error"])
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"unicode/utf8"
 )
@@ -54,16 +55,22 @@ func newStatusError(op string, resp *http.Response) error {
 
 // PublicError renders err for a response to the application that configures
 // clients. The endpoint chose the body text a StatusError carries, and a test
-// can aim at any address, so that text is left out; any message is cut to
-// maxErrorDetail bytes and loses control characters.
+// can aim at any address, so that text is left out; so is the URL a request
+// that got no answer names, which is the client's configured address — the
+// method and what went wrong stay. Any message is cut to maxErrorDetail bytes
+// and loses control characters.
 func PublicError(err error) string {
 	if err == nil {
 		return ""
 	}
 	msg := err.Error()
 	var se *StatusError
-	if errors.As(err, &se) {
+	var ue *url.Error
+	switch {
+	case errors.As(err, &se):
 		msg = fmt.Sprintf("%s: HTTP %d", se.Op, se.Code)
+	case errors.As(err, &ue) && ue.Err != nil:
+		msg = strings.Replace(msg, ue.Error(), ue.Op+": "+ue.Err.Error(), 1)
 	}
 	return truncate(strings.Map(func(r rune) rune {
 		if isControl(r) {
